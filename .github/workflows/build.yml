@@ -137,9 +137,11 @@ jobs:
           set -eu
           curl --proto '=https' --tlsv1.2 -sSf https://get-ghcup.haskell.org | \
             BOOTSTRAP_HASKELL_NONINTERACTIVE=1 \
-            BOOTSTRAP_HASKELL_MINIMAL=1 \
+            BOOTSTRAP_HASKELL_INSTALL_NO_STACK=1 \
+            BOOTSTRAP_HASKELL_INSTALL_HLS= \
             BOOTSTRAP_HASKELL_GHC_VERSION=${GHC_VERSION} \
             BOOTSTRAP_HASKELL_CABAL_VERSION=${CABAL_VERSION} \
+            BOOTSTRAP_HASKELL_ADJUST_BASHRC= \
             sh
           export PATH="\$HOME/.ghcup/bin:\$PATH"
           ghc --version
