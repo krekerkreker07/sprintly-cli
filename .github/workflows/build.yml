@@ -1,0 +1,192 @@
+# Build sprintly binaries on GitHub Actions.
+#
+# Source of truth for the code is GitLab. This workflow lives in a separate
+# GitHub repo that contains ONLY this file — code is never mirrored.
+# On each run we git-clone from GitLab, build for all 5 targets in parallel,
+# and (optionally) publish a GitHub Release.
+#
+# Required GitHub Secrets in the CI proxy repo:
+#   GITLAB_REPO_URL   — e.g. https://gitlab.com/<user>/sprintly.git
+#                       (for private repos use: https://oauth2:<TOKEN>@gitlab.com/...)
+#
+# Trigger from GitLab CI:
+#   POST /repos/<owner>/<repo>/actions/workflows/build.yml/dispatches
+#     body: {"ref":"main","inputs":{"ref":"<SHA-or-tag>","make_release":"true"}}
+
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'GitLab git ref to build (SHA, tag, or branch)'
+        required: true
+        default: 'main'
+      make_release:
+        description: 'Create a GitHub Release with all artifacts'
+        required: false
+        default: 'false'
+      release_tag:
+        description: 'Tag name for the GitHub Release (defaults to inputs.ref)'
+        required: false
+        default: ''
+
+env:
+  GHC_VERSION: '9.8.2'
+  CABAL_VERSION: '3.12.1.0'
+  COMMON_GHC_OPTS: '-O2 -split-sections -fexpose-all-unfoldings -fspecialise-aggressively'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            os: ubuntu-latest
+            container: benz0li/ghc-musl:9.8.2
+            artifact: sprintly-linux-amd64
+            static: true
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+            container: benz0li/ghc-musl:9.8.2
+            artifact: sprintly-linux-arm64
+            static: true
+          - target: windows-amd64
+            os: windows-latest
+            artifact: sprintly-windows-amd64.exe
+            static: false
+          - target: macos-arm64
+            os: macos-14
+            artifact: sprintly-macos-arm64
+            static: false
+          - target: macos-x86_64
+            os: macos-13
+            artifact: sprintly-macos-x86_64
+            static: false
+
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 60
+
+    steps:
+      # Linux containers (alpine-based) may be missing git/curl — install them first.
+      - name: Bootstrap container tools
+        if: matrix.container != ''
+        shell: sh
+        run: apk add --no-cache git curl xz bash
+
+      - name: Clone source from GitLab
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Clone full history into the workspace; checkout the requested ref.
+          # GitHub provides a non-empty workspace dir; clean it first.
+          shopt -s dotglob nullglob
+          rm -rf ./* || true
+          git clone "${{ secrets.GITLAB_REPO_URL }}" .
+          git fetch --all --tags
+          git checkout "${{ inputs.ref }}"
+          git log -1 --oneline
+
+      # Non-container hosts (Windows, macOS) get Haskell via the official action.
+      - name: Setup GHC + cabal
+        if: matrix.container == ''
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: ${{ env.GHC_VERSION }}
+          cabal-version: ${{ env.CABAL_VERSION }}
+
+      - name: Cache cabal store
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cabal/store
+            ~/.cabal/packages
+            dist-newstyle
+          key: cabal-${{ matrix.target }}-${{ hashFiles('sprintlycli.cabal') }}
+          restore-keys: |
+            cabal-${{ matrix.target }}-
+
+      - name: cabal update
+        shell: bash
+        run: cabal update
+
+      - name: Build (static, Linux only)
+        if: matrix.static == true
+        shell: bash
+        run: |
+          cabal build exe:sprintly \
+            --enable-executable-static \
+            --ghc-options="${COMMON_GHC_OPTS} -optl-static -optl-pthread -fPIC"
+
+      - name: Build (dynamic, Windows/macOS)
+        if: matrix.static == false
+        shell: bash
+        run: |
+          cabal build exe:sprintly \
+            --ghc-options="${COMMON_GHC_OPTS}"
+
+      - name: Collect + strip artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          bin=$(cabal list-bin exe:sprintly)
+          cp "$bin" "out/${{ matrix.artifact }}"
+          # `strip` exists everywhere we run; ignore failure on platforms where it complains.
+          strip "out/${{ matrix.artifact }}" || true
+          ls -lh out/
+          file "out/${{ matrix.artifact }}" || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: out/${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: GitHub Release
+    needs: build
+    if: inputs.make_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          ls -lh
+
+      - name: Pick release tag
+        id: tag
+        run: |
+          tag="${{ inputs.release_tag }}"
+          if [ -z "$tag" ]; then tag="${{ inputs.ref }}"; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: sprintly ${{ steps.tag.outputs.tag }}
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          files: |
+            dist/sprintly-linux-amd64
+            dist/sprintly-linux-arm64
+            dist/sprintly-windows-amd64.exe
+            dist/sprintly-macos-arm64
+            dist/sprintly-macos-x86_64
+            dist/SHA256SUMS.txt
