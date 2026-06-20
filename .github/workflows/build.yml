@@ -1,17 +1,25 @@
 # Build sprintly binaries on GitHub Actions.
 #
 # Source of truth for the code is GitLab. This workflow lives in a separate
-# GitHub repo that contains ONLY this file — code is never mirrored.
-# On each run we git-clone from GitLab, build for all 5 targets in parallel,
+# GitHub repo containing ONLY this file — code is never mirrored.
+# On each run we git-clone from GitLab, build all 5 targets in parallel,
 # and (optionally) publish a GitHub Release.
 #
 # Required GitHub Secrets in the CI proxy repo:
 #   GITLAB_REPO_URL   — e.g. https://gitlab.com/<user>/sprintly.git
-#                       (for private repos use: https://oauth2:<TOKEN>@gitlab.com/...)
+#                       (for private repos: https://oauth2:<TOKEN>@gitlab.com/...
+#                       or https://<deploy-token-username>:<token>@gitlab.com/...)
 #
 # Trigger from GitLab CI:
 #   POST /repos/<owner>/<repo>/actions/workflows/build.yml/dispatches
 #     body: {"ref":"main","inputs":{"ref":"<SHA-or-tag>","make_release":"true"}}
+#
+# Architecture note: Linux jobs run on the GitHub-hosted host (ubuntu-*) WITHOUT
+# a `container:` block, then `docker run` the benz0li/ghc-musl image only for
+# the cabal-build step. This is required because JavaScript actions like
+# actions/cache do not work inside Alpine arm64 containers (GitHub does not
+# ship arm64-musl node). With this layout actions/cache runs on the glibc host
+# and we bind-mount the cabal store into the build container.
 
 name: build
 
@@ -35,6 +43,7 @@ env:
   GHC_VERSION: '9.8.2'
   CABAL_VERSION: '3.12.1.0'
   COMMON_GHC_OPTS: '-O2 -split-sections -fexpose-all-unfoldings -fspecialise-aggressively'
+  GHC_MUSL_IMAGE: 'benz0li/ghc-musl:9.8.2'
 
 jobs:
   build:
@@ -44,45 +53,34 @@ jobs:
         include:
           - target: linux-amd64
             os: ubuntu-latest
-            container: benz0li/ghc-musl:9.8.2
+            kind: linux-static
             artifact: sprintly-linux-amd64
-            static: true
           - target: linux-arm64
             os: ubuntu-24.04-arm
-            container: benz0li/ghc-musl:9.8.2
+            kind: linux-static
             artifact: sprintly-linux-arm64
-            static: true
           - target: windows-amd64
             os: windows-latest
+            kind: native
             artifact: sprintly-windows-amd64.exe
-            static: false
           - target: macos-arm64
             os: macos-14
+            kind: native
             artifact: sprintly-macos-arm64
-            static: false
           - target: macos-x86_64
             os: macos-13
+            kind: native
             artifact: sprintly-macos-x86_64
-            static: false
 
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container }}
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
-      # Linux containers (alpine-based) may be missing git/curl — install them first.
-      - name: Bootstrap container tools
-        if: matrix.container != ''
-        shell: sh
-        run: apk add --no-cache git curl xz bash
-
       - name: Clone source from GitLab
         shell: bash
         run: |
           set -euo pipefail
-          # Container jobs run as root while the workspace dir is owned by the
-          # runner user — git would refuse with "dubious ownership" otherwise.
           git config --global --add safe.directory '*'
           shopt -s dotglob nullglob
           rm -rf ./* || true
@@ -91,15 +89,16 @@ jobs:
           git checkout "${{ inputs.ref }}"
           git log -1 --oneline
 
-      # Non-container hosts (Windows, macOS) get Haskell via the official action.
-      - name: Setup GHC + cabal
-        if: matrix.container == ''
+      # ---- Native (Windows / macOS) toolchain ---------------------------------
+      - name: Setup GHC + cabal (native)
+        if: matrix.kind == 'native'
         uses: haskell-actions/setup@v2
         with:
           ghc-version: ${{ env.GHC_VERSION }}
           cabal-version: ${{ env.CABAL_VERSION }}
 
-      - name: Cache cabal store
+      - name: Cache cabal store (native)
+        if: matrix.kind == 'native'
         uses: actions/cache@v4
         with:
           path: |
@@ -110,36 +109,57 @@ jobs:
           restore-keys: |
             cabal-${{ matrix.target }}-
 
-      - name: cabal update
-        shell: bash
-        run: cabal update
-
-      - name: Build (static, Linux only)
-        if: matrix.static == true
-        shell: bash
-        run: |
-          cabal build exe:sprintly \
-            --enable-executable-static \
-            --ghc-options="${COMMON_GHC_OPTS} -optl-static -optl-pthread -fPIC"
-
-      - name: Build (dynamic, Windows/macOS)
-        if: matrix.static == false
-        shell: bash
-        run: |
-          cabal build exe:sprintly \
-            --ghc-options="${COMMON_GHC_OPTS}"
-
-      - name: Collect + strip artifact
+      - name: Build (native)
+        if: matrix.kind == 'native'
         shell: bash
         run: |
           set -euo pipefail
+          cabal update
+          cabal build exe:sprintly --ghc-options="${COMMON_GHC_OPTS}"
           mkdir -p out
           bin=$(cabal list-bin exe:sprintly)
           cp "$bin" "out/${{ matrix.artifact }}"
-          # `strip` exists everywhere we run; ignore failure on platforms where it complains.
           strip "out/${{ matrix.artifact }}" || true
           ls -lh out/
           file "out/${{ matrix.artifact }}" || true
+
+      # ---- Linux static (musl, via docker run on the host) --------------------
+      - name: Cache cabal store (linux-static)
+        if: matrix.kind == 'linux-static'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ github.workspace }}/.cache/cabal-store
+            ${{ github.workspace }}/.cache/cabal-packages
+            ${{ github.workspace }}/dist-newstyle
+          key: cabal-${{ matrix.target }}-${{ hashFiles('sprintlycli.cabal') }}
+          restore-keys: |
+            cabal-${{ matrix.target }}-
+
+      - name: Build (linux-static via docker)
+        if: matrix.kind == 'linux-static'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .cache/cabal-store .cache/cabal-packages out
+          # benz0li image is multi-arch; docker pulls the right variant for the
+          # host's architecture (ubuntu-latest=amd64, ubuntu-24.04-arm=arm64).
+          docker run --rm \
+            -v "${PWD}:/work" -w /work \
+            -v "${PWD}/.cache/cabal-store:/root/.cabal/store" \
+            -v "${PWD}/.cache/cabal-packages:/root/.cabal/packages" \
+            "${GHC_MUSL_IMAGE}" \
+            sh -c "
+              set -eu
+              cabal update
+              cabal build exe:sprintly \
+                --enable-executable-static \
+                --ghc-options='${COMMON_GHC_OPTS}'
+              cp \$(cabal list-bin exe:sprintly) /work/out/${{ matrix.artifact }}
+              strip --strip-all /work/out/${{ matrix.artifact }}
+            "
+          ls -lh out/
+          file "out/${{ matrix.artifact }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
