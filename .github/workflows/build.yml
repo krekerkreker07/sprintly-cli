@@ -81,8 +81,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Clone full history into the workspace; checkout the requested ref.
-          # GitHub provides a non-empty workspace dir; clean it first.
+          # Container jobs run as root while the workspace dir is owned by the
+          # runner user — git would refuse with "dubious ownership" otherwise.
+          git config --global --add safe.directory '*'
           shopt -s dotglob nullglob
           rm -rf ./* || true
           git clone "${{ secrets.GITLAB_REPO_URL }}" .
