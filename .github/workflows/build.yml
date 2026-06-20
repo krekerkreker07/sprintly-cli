@@ -68,8 +68,8 @@ jobs:
             kind: native
             artifact: sprintly-macos-arm64
           - target: macos-x86_64
-            os: macos-13
-            kind: native
+            os: macos-14
+            kind: macos-rosetta
             artifact: sprintly-macos-x86_64
 
     name: build (${{ matrix.target }})
@@ -120,6 +120,59 @@ jobs:
           bin=$(cabal list-bin exe:sprintly)
           cp "$bin" "out/${{ matrix.artifact }}"
           strip "out/${{ matrix.artifact }}" || true
+          ls -lh out/
+          file "out/${{ matrix.artifact }}" || true
+
+      # ---- macOS Intel (Rosetta 2 on a macos-14 M1 runner) --------------------
+      - name: Install x86_64 toolchain via Rosetta
+        if: matrix.kind == 'macos-rosetta'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # macos-14 runners ship with Rosetta 2 pre-installed; ensure anyway.
+          softwareupdate --install-rosetta --agree-to-license 2>/dev/null || true
+          # Install x86_64 GHC + cabal into ~/.ghcup. When run under Rosetta,
+          # ghcup downloads the darwin-x86_64 distribution.
+          arch -x86_64 /bin/bash <<EOF
+          set -eu
+          curl --proto '=https' --tlsv1.2 -sSf https://get-ghcup.haskell.org | \
+            BOOTSTRAP_HASKELL_NONINTERACTIVE=1 \
+            BOOTSTRAP_HASKELL_MINIMAL=1 \
+            BOOTSTRAP_HASKELL_GHC_VERSION=${GHC_VERSION} \
+            BOOTSTRAP_HASKELL_CABAL_VERSION=${CABAL_VERSION} \
+            sh
+          export PATH="\$HOME/.ghcup/bin:\$PATH"
+          ghc --version
+          cabal --version
+          EOF
+
+      - name: Cache cabal store (macos-rosetta)
+        if: matrix.kind == 'macos-rosetta'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cabal/store
+            ~/.cabal/packages
+            dist-newstyle
+          key: cabal-${{ matrix.target }}-${{ hashFiles('sprintlycli.cabal') }}
+          restore-keys: |
+            cabal-${{ matrix.target }}-
+
+      - name: Build (macos-rosetta)
+        if: matrix.kind == 'macos-rosetta'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          arch -x86_64 /bin/bash <<EOF
+          set -eu
+          export PATH="\$HOME/.ghcup/bin:\$PATH"
+          cabal update
+          cabal build exe:sprintly --ghc-options="${COMMON_GHC_OPTS}"
+          bin=\$(cabal list-bin exe:sprintly)
+          cp "\$bin" "out/${{ matrix.artifact }}"
+          strip "out/${{ matrix.artifact }}" || true
+          EOF
           ls -lh out/
           file "out/${{ matrix.artifact }}" || true
 
