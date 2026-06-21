@@ -14,6 +14,13 @@
 #   POST /repos/<owner>/<repo>/actions/workflows/build.yml/dispatches
 #     body: {"ref":"main","inputs":{"ref":"<SHA-or-tag>","make_release":"true"}}
 #
+# Versioning:
+#   Source of truth — `version:` у sprintlycli.cabal. CI читає його,
+#   зашиває у назви артефактів (`sprintly-<VER>-<platform>`) і у бінарник
+#   (через -DBUILD_SHA="<short-sha>" — команда `sprintly version` друкує обидва).
+#   При make_release=true CI вимагає, щоб release_tag дорівнював `v<cabal version>`,
+#   інакше fail — це не дає опублікувати реліз з неузгодженою версією.
+#
 # Architecture note: Linux jobs run on the GitHub-hosted host (ubuntu-*) WITHOUT
 # a `container:` block, then `docker run` the benz0li/ghc-musl image only for
 # the cabal-build step. This is required because JavaScript actions like
@@ -42,11 +49,78 @@ on:
 env:
   GHC_VERSION: '9.8.2'
   CABAL_VERSION: '3.12.1.0'
-  COMMON_GHC_OPTS: '-O2 -split-sections -fexpose-all-unfoldings -fspecialise-aggressively'
+  # -split-sections розкладає кожну функцію в окрему ELF/Mach-O секцію, після
+  # чого linker з --gc-sections (Linux/Windows) або -dead_strip (macOS) викидає
+  # мертві секції. Самого -split-sections недостатньо — потрібен пара з GC-flag,
+  # який додається per-platform у відповідному build-step нижче.
+  # Прапори -fexpose-all-unfoldings та -fspecialise-aggressively свідомо
+  # прибрано: вони експортують усі тіла функцій для cross-module inlining
+  # заради продуктивності, але роздувають бінарник на 20–40%. Для CLI, де
+  # hot-path — це HTTP-запит, такий trade-off безглуздий.
+  COMMON_GHC_OPTS: '-O2 -split-sections'
   GHC_MUSL_IMAGE: 'benz0li/ghc-musl:9.8.2'
 
 jobs:
+  # Окремий job, щоб усі білди читали ту саму версію й ту саму перевірку
+  # тег↔cabal проходили один раз. matrix job-и беруть value через `needs.prep`.
+  prep:
+    name: prepare (read version, validate)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.cabal.outputs.version }}
+      sha: ${{ steps.cabal.outputs.sha }}
+    steps:
+      - name: Clone source from GitLab
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          git clone "${{ secrets.GITLAB_REPO_URL }}" .
+          git fetch --all --tags
+          git checkout "${{ inputs.ref }}"
+
+      - name: Read cabal version + short SHA
+        id: cabal
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 -E '^version:' sprintlycli.cabal | awk '{print $2}')
+          SHA=$(git rev-parse --short=12 HEAD)
+          if [ -z "$VERSION" ]; then
+            echo "::error::could not read version from sprintlycli.cabal"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Cabal version: ${VERSION}"
+          echo "Build SHA: ${SHA}"
+
+      - name: Validate release tag matches cabal version
+        if: inputs.make_release == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.cabal.outputs.version }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          TAG="${RELEASE_TAG:-$REF}"
+          # Дозволяємо `v0.2.0`, `0.2.0`, або `v0.2.0.0` ≡ `0.2.0` (cabal-стиль)
+          NORM_TAG="${TAG#v}"
+          if [ "${NORM_TAG}" != "${VERSION}" ]; then
+            echo "::error::Release tag '${TAG}' (normalized: '${NORM_TAG}') does not match cabal version '${VERSION}'."
+            echo "::error::Bump 'version:' у sprintlycli.cabal або перетегніть."
+            exit 1
+          fi
+          # Перевірка SemVer-формату самого тегу.
+          if ! echo "${NORM_TAG}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9.-]+)?$'; then
+            echo "::error::Tag '${TAG}' is not valid SemVer (e.g. v0.2.0)."
+            exit 1
+          fi
+          echo "✓ Release tag '${TAG}' matches cabal version '${VERSION}'."
+
   build:
+    needs: prep
     strategy:
       fail-fast: false
       matrix:
@@ -54,27 +128,26 @@ jobs:
           - target: linux-amd64
             os: ubuntu-latest
             kind: linux-static
-            artifact: sprintly-linux-amd64
           - target: linux-arm64
             os: ubuntu-24.04-arm
             kind: linux-static
-            artifact: sprintly-linux-arm64
           - target: windows-amd64
             os: windows-latest
             kind: native
-            artifact: sprintly-windows-amd64.exe
+            ext: .exe
           - target: macos-arm64
             os: macos-14
             kind: native
-            artifact: sprintly-macos-arm64
           - target: macos-x86_64
             os: macos-14
             kind: macos-rosetta
-            artifact: sprintly-macos-x86_64
 
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
+    env:
+      VERSION: ${{ needs.prep.outputs.version }}
+      BUILD_SHA: ${{ needs.prep.outputs.sha }}
 
     steps:
       - name: Clone source from GitLab
@@ -89,41 +162,87 @@ jobs:
           git checkout "${{ inputs.ref }}"
           git log -1 --oneline
 
+      - name: Compute artifact name
+        id: name
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Уніфікований формат: sprintly-<version>-<target>[.exe]
+          name="sprintly-${VERSION}-${{ matrix.target }}${{ matrix.ext || '' }}"
+          echo "artifact=${name}" >> "$GITHUB_OUTPUT"
+          echo "Artifact: ${name}"
+
       # ---- Native (Windows / macOS) toolchain ---------------------------------
       - name: Setup GHC + cabal (native)
+        id: setup
         if: matrix.kind == 'native'
         uses: haskell-actions/setup@v2
         with:
           ghc-version: ${{ env.GHC_VERSION }}
           cabal-version: ${{ env.CABAL_VERSION }}
 
+      # NB: на Windows cabal store НЕ у ~/.cabal/store, а у шляху, який
+      # haskell-actions/setup віддає через outputs.cabal-store (зазвичай C:\sr).
+      # Тому кешуємо саме цей шлях, інакше Windows-білд щоразу перекомпілює
+      # всі залежності з нуля. У ключ додаємо версії GHC/Cabal — щоб бамп
+      # тулчейну не дав broken cache hit.
       - name: Cache cabal store (native)
         if: matrix.kind == 'native'
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cabal/store
-            ~/.cabal/packages
+            ${{ steps.setup.outputs.cabal-store }}
             dist-newstyle
-          key: cabal-${{ matrix.target }}-${{ hashFiles('sprintlycli.cabal') }}
+          key: cabal-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}-${{ hashFiles('sprintlycli.cabal') }}
           restore-keys: |
+            cabal-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}-
             cabal-${{ matrix.target }}-
 
       - name: Build (native)
         if: matrix.kind == 'native'
         shell: bash
+        env:
+          ARTIFACT: ${{ steps.name.outputs.artifact }}
         run: |
           set -euo pipefail
           cabal update
-          cabal build exe:sprintly --ghc-options="${COMMON_GHC_OPTS}"
+          # -DBUILD_SHA вшиває коротке SHA у бінарник; читається у Cli.Commands.
+          # Cabal shell-tokenize-ить value --ghc-options і стрипить ОДИН рівень
+          # лапок; щоб GHC побачив `-DBUILD_SHA="abc"` (з лапками), треба двічі
+          # ескейпнути: external `"..."` для cabal-парсера + internal `\"..\"`
+          # для CPP. Перевірено емпірично — без подвійного ескейпу макрос
+          # розгортається без лапок і компіляція падає на parse error.
+          SHA_OPT='-DBUILD_SHA="\"'"${BUILD_SHA}"'\""'
+          # Linker GC: на macOS ld64 розуміє лише -dead_strip; на Windows
+          # mingw-ld та lld підтримують GNU-style --gc-sections.
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            LD_GC_OPT='-optl-Wl,-dead_strip'
+          else
+            LD_GC_OPT='-optl-Wl,--gc-sections'
+          fi
+          cabal build exe:sprintly \
+            --ghc-options="${COMMON_GHC_OPTS}" \
+            --ghc-options="${LD_GC_OPT}" \
+            --ghc-options="${SHA_OPT}"
           mkdir -p out
           bin=$(cabal list-bin exe:sprintly)
-          cp "$bin" "out/${{ matrix.artifact }}"
-          strip "out/${{ matrix.artifact }}" || true
+          cp "$bin" "out/${ARTIFACT}"
+          strip "out/${ARTIFACT}" || true
           ls -lh out/
-          file "out/${{ matrix.artifact }}" || true
+          file "out/${ARTIFACT}" || true
 
       # ---- macOS Intel (Rosetta 2 on a macos-14 M1 runner) --------------------
+      # Кеш ghcup-тулчейну (GHC + cabal бінарі під x86_64). Без нього кожен
+      # прогін тратить 5–10 хв на завантаження + установку GHC через ghcup.
+      # Ключ містить версії GHC/Cabal, щоб їх бамп інвалідував кеш автоматично.
+      - name: Cache ghcup toolchain (macos-rosetta)
+        if: matrix.kind == 'macos-rosetta'
+        id: ghcup-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ghcup
+          key: ghcup-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}
+
       - name: Install x86_64 toolchain via Rosetta
         if: matrix.kind == 'macos-rosetta'
         shell: bash
@@ -131,6 +250,14 @@ jobs:
           set -euo pipefail
           # macos-14 runners ship with Rosetta 2 pre-installed; ensure anyway.
           softwareupdate --install-rosetta --agree-to-license 2>/dev/null || true
+          # Якщо кеш ~/.ghcup відновлено — пропускаємо `curl | sh`, який щоразу
+          # стягує і інсталяцію tarball-ів. Це найбільша економія для цього job-у.
+          if [ -x "$HOME/.ghcup/bin/ghc" ] && [ -x "$HOME/.ghcup/bin/cabal" ]; then
+            echo "ghcup toolchain restored from cache; skipping bootstrap"
+            arch -x86_64 "$HOME/.ghcup/bin/ghc" --version
+            arch -x86_64 "$HOME/.ghcup/bin/cabal" --version
+            exit 0
+          fi
           # Install x86_64 GHC + cabal into ~/.ghcup. When run under Rosetta,
           # ghcup downloads the darwin-x86_64 distribution.
           arch -x86_64 /bin/bash <<EOF
@@ -156,27 +283,61 @@ jobs:
             ~/.cabal/store
             ~/.cabal/packages
             dist-newstyle
-          key: cabal-${{ matrix.target }}-${{ hashFiles('sprintlycli.cabal') }}
+          key: cabal-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}-${{ hashFiles('sprintlycli.cabal') }}
           restore-keys: |
+            cabal-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}-
             cabal-${{ matrix.target }}-
 
       - name: Build (macos-rosetta)
         if: matrix.kind == 'macos-rosetta'
         shell: bash
+        env:
+          ARTIFACT: ${{ steps.name.outputs.artifact }}
         run: |
           set -euo pipefail
           mkdir -p out
+          # Те саме подвійне-екранування `-DBUILD_SHA`, що й у native-кроці.
+          # SHA_OPT обчислюємо в HOST-shell-і ДО heredoc, потім підставляємо
+          # як готовий рядок — щоб уникнути третього рівня escape всередині
+          # Rosetta-bash.
+          SHA_OPT='-DBUILD_SHA="\"'"${BUILD_SHA}"'\""'
+          # macOS ld64 → -dead_strip (аналог --gc-sections для Mach-O).
+          LD_GC_OPT='-optl-Wl,-dead_strip'
           arch -x86_64 /bin/bash <<EOF
           set -eu
           export PATH="\$HOME/.ghcup/bin:\$PATH"
           cabal update
-          cabal build exe:sprintly --ghc-options="${COMMON_GHC_OPTS}"
+          cabal build exe:sprintly \
+            --ghc-options="${COMMON_GHC_OPTS}" \
+            --ghc-options="${LD_GC_OPT}" \
+            --ghc-options="${SHA_OPT}"
           bin=\$(cabal list-bin exe:sprintly)
-          cp "\$bin" "out/${{ matrix.artifact }}"
-          strip "out/${{ matrix.artifact }}" || true
+          cp "\$bin" "out/${ARTIFACT}"
+          strip "out/${ARTIFACT}" || true
           EOF
           ls -lh out/
-          file "out/${{ matrix.artifact }}" || true
+          file "out/${ARTIFACT}" || true
+
+      # ---- Ad-hoc codesign for macOS (both native arm64 and Rosetta x86_64) --
+      # Без підпису macOS відмовляється запускати скачаний бінарник з
+      # "killed: 9" / "is damaged" (особливо на Apple Silicon). Ad-hoc підпис
+      # (-s -) не вимагає AppleID акаунту, але дає бінарнику валідний embedded
+      # signature, після чого Gatekeeper хоча б показує нормальний діалог
+      # замість "damaged". Для файлів з Safari користувачу все одно треба
+      # один раз `xattr -d com.apple.quarantine ./sprintly` — це обходиться
+      # тільки через notarization з Apple Developer ID ($99/рік).
+      # --options=runtime (hardened runtime) додаємо одразу: якщо колись
+      # додамо notarization, hardened runtime для неї обов'язковий.
+      - name: Ad-hoc codesign (macOS)
+        if: (matrix.kind == 'native' && startsWith(matrix.target, 'macos')) || matrix.kind == 'macos-rosetta'
+        shell: bash
+        env:
+          ARTIFACT: ${{ steps.name.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          codesign --force --options=runtime --sign - "out/${ARTIFACT}"
+          codesign --verify --strict --verbose=2 "out/${ARTIFACT}"
+          codesign --display --verbose=2 "out/${ARTIFACT}" 2>&1 | head -20
 
       # ---- Linux static (musl, via docker run on the host) --------------------
       - name: Cache cabal store (linux-static)
@@ -187,50 +348,69 @@ jobs:
             ${{ github.workspace }}/.cache/cabal-store
             ${{ github.workspace }}/.cache/cabal-packages
             ${{ github.workspace }}/dist-newstyle
-          key: cabal-${{ matrix.target }}-${{ hashFiles('sprintlycli.cabal') }}
+          key: cabal-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}-${{ hashFiles('sprintlycli.cabal') }}
           restore-keys: |
+            cabal-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}-
             cabal-${{ matrix.target }}-
 
       - name: Build (linux-static via docker)
         if: matrix.kind == 'linux-static'
         shell: bash
+        env:
+          ARTIFACT: ${{ steps.name.outputs.artifact }}
         run: |
           set -euo pipefail
           mkdir -p .cache/cabal-store .cache/cabal-packages out
           # benz0li image is multi-arch; docker pulls the right variant for the
           # host's architecture (ubuntu-latest=amd64, ubuntu-24.04-arm=arm64).
+          # COMMON_GHC_OPTS, BUILD_SHA, ARTIFACT передаємо у контейнер через -e.
+          # SHA_OPT збираємо ВСЕРЕДИНІ контейнера: cabal стрипить один рівень
+          # лапок з --ghc-options value, тому треба `"\"abc\""` щоб GHC побачив
+          # `BUILD_SHA="abc"` як рядковий літерал.
           docker run --rm \
+            -e BUILD_SHA="${BUILD_SHA}" \
+            -e COMMON_GHC_OPTS="${COMMON_GHC_OPTS}" \
+            -e ARTIFACT="${ARTIFACT}" \
             -v "${PWD}:/work" -w /work \
             -v "${PWD}/.cache/cabal-store:/root/.cabal/store" \
             -v "${PWD}/.cache/cabal-packages:/root/.cabal/packages" \
             "${GHC_MUSL_IMAGE}" \
-            sh -c "
-              set -eu
+            sh -eu -c '
               cabal update
+              SHA_OPT="-DBUILD_SHA=\"\\\"${BUILD_SHA}\\\"\""
+              # GNU ld у musl-образі підтримує --gc-sections; разом з
+              # -split-sections у COMMON_GHC_OPTS це викидає мертві секції.
+              LD_GC_OPT="-optl-Wl,--gc-sections"
               cabal build exe:sprintly \
                 --enable-executable-static \
-                --ghc-options='${COMMON_GHC_OPTS}'
-              cp \$(cabal list-bin exe:sprintly) /work/out/${{ matrix.artifact }}
-              strip --strip-all /work/out/${{ matrix.artifact }}
-            "
+                --ghc-options="${COMMON_GHC_OPTS}" \
+                --ghc-options="${LD_GC_OPT}" \
+                --ghc-options="${SHA_OPT}"
+              cp "$(cabal list-bin exe:sprintly)" "/work/out/${ARTIFACT}"
+              # -R .comment / -R .note: викидаємо ідентифікатори ld + build-id;
+              # для CLI з публічним релізом ці секції безкорисні.
+              strip --strip-all -R .comment -R .note "/work/out/${ARTIFACT}"
+            '
           ls -lh out/
-          file "out/${{ matrix.artifact }}"
+          file "out/${ARTIFACT}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: out/${{ matrix.artifact }}
+          name: ${{ steps.name.outputs.artifact }}
+          path: out/${{ steps.name.outputs.artifact }}
           if-no-files-found: error
           retention-days: 14
 
   release:
     name: GitHub Release
-    needs: build
+    needs: [prep, build]
     if: inputs.make_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      VERSION: ${{ needs.prep.outputs.version }}
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -238,9 +418,23 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Fetch installer scripts from GitLab
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Клонуємо у tmp, не у dist/, щоб не зачепити вже завантажені артефакти.
+          git config --global --add safe.directory '*'
+          git clone --depth=1 --branch "${{ inputs.ref }}" \
+            "${{ secrets.GITLAB_REPO_URL }}" src
+          cp src/scripts/install.sh   dist/install.sh
+          cp src/scripts/uninstall.sh dist/uninstall.sh
+          chmod +x dist/install.sh dist/uninstall.sh
+
       - name: Compute checksums
         run: |
           cd dist
+          # install.sh / uninstall.sh теж потрапляють у SHA256SUMS.txt — корисно
+          # для аудиту, навіть якщо звичайний користувач тягне їх через curl|sh.
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
           ls -lh
@@ -260,9 +454,11 @@ jobs:
           generate_release_notes: false
           fail_on_unmatched_files: true
           files: |
-            dist/sprintly-linux-amd64
-            dist/sprintly-linux-arm64
-            dist/sprintly-windows-amd64.exe
-            dist/sprintly-macos-arm64
-            dist/sprintly-macos-x86_64
+            dist/sprintly-${{ env.VERSION }}-linux-amd64
+            dist/sprintly-${{ env.VERSION }}-linux-arm64
+            dist/sprintly-${{ env.VERSION }}-windows-amd64.exe
+            dist/sprintly-${{ env.VERSION }}-macos-arm64
+            dist/sprintly-${{ env.VERSION }}-macos-x86_64
+            dist/install.sh
+            dist/uninstall.sh
             dist/SHA256SUMS.txt
