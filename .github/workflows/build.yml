@@ -498,9 +498,14 @@ jobs:
         run: |
           set -euo pipefail
           # Клонуємо у tmp, не у dist/, щоб не зачепити вже завантажені артефакти.
+          # `git clone --branch` приймає лише імена бранчів/тегів — не SHA, тому
+          # робимо повний clone і потім checkout того самого `inputs.ref`, що й
+          # решта джобів (prep, build). Інакше workflow_dispatch із SHA падає
+          # на `Remote branch <sha> not found in upstream origin`.
           git config --global --add safe.directory '*'
-          git clone --depth=1 --branch "${{ inputs.ref }}" \
-            "${{ secrets.GITLAB_REPO_URL }}" src
+          git clone "${{ secrets.GITLAB_REPO_URL }}" src
+          git -C src fetch --all --tags
+          git -C src checkout "${{ inputs.ref }}"
           cp src/scripts/install.sh   dist/install.sh
           cp src/scripts/uninstall.sh dist/uninstall.sh
           chmod +x dist/install.sh dist/uninstall.sh
