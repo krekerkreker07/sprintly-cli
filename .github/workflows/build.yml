@@ -53,11 +53,12 @@ env:
   # чого linker з --gc-sections (Linux/Windows) або -dead_strip (macOS) викидає
   # мертві секції. Самого -split-sections недостатньо — потрібен пара з GC-flag,
   # який додається per-platform у відповідному build-step нижче.
-  # Прапори -fexpose-all-unfoldings та -fspecialise-aggressively свідомо
-  # прибрано: вони експортують усі тіла функцій для cross-module inlining
-  # заради продуктивності, але роздувають бінарник на 20–40%. Для CLI, де
-  # hot-path — це HTTP-запит, такий trade-off безглуздий.
-  COMMON_GHC_OPTS: '-O2 -split-sections'
+  # -fexpose-all-unfoldings + -fspecialise-aggressively на цьому стеку
+  # парадоксально ЗМЕНШУЮТЬ розмір бінарника: aggressive inlining дозволяє
+  # GHC викинути функції, що мають єдиний (тепер inlined) call-site, тому
+  # подальший linker dead-strip має більше мертвого коду на викидання.
+  # Замір 2026-06-21 (macOS arm64): без цих прапорів бінарник зростає на ~8 МБ.
+  COMMON_GHC_OPTS: '-O2 -split-sections -fexpose-all-unfoldings -fspecialise-aggressively'
   GHC_MUSL_IMAGE: 'benz0li/ghc-musl:9.8.2'
 
 jobs:
@@ -296,23 +297,27 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p out
-          # Те саме подвійне-екранування `-DBUILD_SHA`, що й у native-кроці.
-          # SHA_OPT обчислюємо в HOST-shell-і ДО heredoc, потім підставляємо
-          # як готовий рядок — щоб уникнути третього рівня escape всередині
-          # Rosetta-bash.
-          SHA_OPT='-DBUILD_SHA="\"'"${BUILD_SHA}"'\""'
-          # macOS ld64 → -dead_strip (аналог --gc-sections для Mach-O).
-          LD_GC_OPT='-optl-Wl,-dead_strip'
-          arch -x86_64 /bin/bash <<EOF
+          # Quoted heredoc (`<<'EOF'`) забороняє host-shell expansion. Усі
+          # змінні (BUILD_SHA, COMMON_GHC_OPTS, ARTIFACT) читаються з env
+          # ВНУТРІШНІМ bash-ом — це уникає подвійного escape lapok через
+          # два рівні shell-парсингу (host → arch-x86_64 bash), на якому
+          # раніше -DBUILD_SHA розгортався без лапок і ламав CPP.
+          arch -x86_64 /bin/bash <<'EOF'
           set -eu
-          export PATH="\$HOME/.ghcup/bin:\$PATH"
+          export PATH="$HOME/.ghcup/bin:$PATH"
           cabal update
+          # Один рівень escape: `\"` всередині "..."-string дає буквальну `"`,
+          # після cabal-stripping одного рівня лапок GHC побачить
+          # `-DBUILD_SHA="<sha>"` — рядковий літерал, як треба CPP.
+          SHA_OPT="-DBUILD_SHA=\"\\\"${BUILD_SHA}\\\"\""
+          # macOS ld64 → -dead_strip (аналог --gc-sections для Mach-O).
+          LD_GC_OPT="-optl-Wl,-dead_strip"
           cabal build exe:sprintly \
             --ghc-options="${COMMON_GHC_OPTS}" \
             --ghc-options="${LD_GC_OPT}" \
             --ghc-options="${SHA_OPT}"
-          bin=\$(cabal list-bin exe:sprintly)
-          cp "\$bin" "out/${ARTIFACT}"
+          bin=$(cabal list-bin exe:sprintly)
+          cp "$bin" "out/${ARTIFACT}"
           strip "out/${ARTIFACT}" || true
           EOF
           ls -lh out/
