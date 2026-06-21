@@ -1,0 +1,204 @@
+{
+  "name": "sprintly",
+  "version": "1.0.0",
+  "description": "Drive the sprintly CLI for sprintly.cloud task tracking. LLM-agnostic mirror of SKILL.md.",
+  "binary": {
+    "preferred": "sprintly",
+    "fallback": "~/.sprintly/bin/sprintly",
+    "shell_resolver": "$(command -v sprintly || echo \"$HOME/.sprintly/bin/sprintly\")"
+  },
+  "auth": {
+    "session_path": "~/.sprintly/session",
+    "login": "sprintly login --url <identity URL> [--headless]",
+    "headless_trigger": "missing DISPLAY/WAYLAND_DISPLAY auto-selects the code-pairing prompt",
+    "logout_warning": "Run only when the user explicitly asks; revokes the saved session."
+  },
+  "lookups": [
+    {"command": "projects", "returns": "project IDs, slug, name"},
+    {"command": "statuses", "returns": "status IDs with closed flag"},
+    {"command": "priorities", "returns": "priority IDs"},
+    {"command": "types", "returns": "issue type IDs"},
+    {"command": "activities", "returns": "work-activity IDs"},
+    {"command": "sprints --project ID", "returns": "sprint IDs per project"},
+    {"command": "custom-fields [--type ID] [--project ID]", "returns": "custom field definitions and value sets"}
+  ],
+  "commands": {
+    "issue show": {
+      "purpose": "Show full detail for one issue.",
+      "required": ["ISSUE_ID"],
+      "example": "sprintly issue show 39"
+    },
+    "issue list": {
+      "purpose": "Search and list issues with rich filtering.",
+      "flags": {
+        "--project": "Project ID (repeatable: OR)",
+        "--sprint": "Sprint ID (repeatable: OR)",
+        "--status": "Numeric ID or literal open|closed|* (repeatable)",
+        "--assignee": "Numeric ID or literal me (repeatable)",
+        "--author": "Numeric ID or literal me (repeatable)",
+        "--type": "Issue type ID (repeatable: OR)",
+        "--priority": "Priority ID (repeatable: OR)",
+        "--category": "Category ID (repeatable: OR)",
+        "--parent": "Parent issue ID",
+        "--subject": "Substring match",
+        "--created-on": "Pass-through query (>=, ><, t, lw, ...)",
+        "--updated-on": "Pass-through query",
+        "--start-date": "Pass-through query",
+        "--due-date": "Pass-through query",
+        "--done-ratio": "0..100 filter",
+        "--is-private": "Filter by privacy flag",
+        "--cf": "ID=VALUE custom-field filter (repeatable)",
+        "--sort": "field[:desc][,field2[:desc]] (e.g. priority:desc,updated_on:desc)",
+        "--columns": "Comma-separated columns; cf:<id> adds a custom-field column",
+        "--limit": "Page size (≤100)",
+        "--offset": "Skip first N",
+        "--all": "Walk every page until total_count"
+      },
+      "columns_available": [
+        "id", "subject", "project", "type", "status", "priority",
+        "author", "assignee", "category", "sprint", "parent",
+        "start-date", "due-date", "done-ratio", "estimated-hours",
+        "is-private", "created", "updated", "description"
+      ],
+      "example": "sprintly issue list --assignee me --status open --sort updated_on:desc"
+    },
+    "issue create": {
+      "purpose": "Create a new issue.",
+      "required": ["--project", "--type", "--subject"],
+      "body_flags": [
+        "--project", "--type", "--status", "--priority", "--subject", "--description",
+        "--category", "--sprint", "--assignee", "--parent",
+        "--is-private", "--no-is-private",
+        "--estimated-hours", "--start-date", "--due-date", "--done-ratio",
+        "--watcher", "--cf"
+      ],
+      "json_input": ["--json-file PATH", "--json-stdin"],
+      "json_semantics": "JSON provides the base body; CLI flags override individual fields.",
+      "example": "sprintly issue create --project 8 --type 1 --subject 'Smoke test' --sprint 8 --assignee 9 --priority 4"
+    },
+    "issue update": {
+      "purpose": "Update an existing issue and/or append a journal comment.",
+      "required": ["--id"],
+      "extra_flags": {
+        "--notes": "Append a journal comment without otherwise mutating the issue",
+        "--private-notes": "Mark the appended comment as private"
+      },
+      "example": "sprintly issue update --id 39 --status 6 --notes 'Ready for review'"
+    },
+    "users": {
+      "purpose": "List backend users with substring / status / group filters, pagination, and selectable columns. Used to look up a numeric user id when `me` does not apply (e.g. for --watcher).",
+      "flags": {
+        "--name": "Substring search across login/mail/firstname/lastname",
+        "--status": "active | locked | registered",
+        "--group": "Numeric group ID",
+        "--hide-admin": "Client-side filter on the admin field. Backend only returns admin to admin callers; for regular users this filter is a no-op.",
+        "--include": "Pass-through extras, e.g. memberships,groups",
+        "--limit": "Page size (default 25, max 100). Ignored with --all.",
+        "--offset": "Skip first N. Ignored with --all.",
+        "--all": "Fetch every page until total_count is reached.",
+        "--columns": "Comma-separated columns. Available: id,login,name,email,last-login,admin. Default: id,login,name,email,last-login."
+      },
+      "example": "sprintly users --name larson --columns id,login,name,email"
+    },
+    "wiki list": {
+      "purpose": "List wiki pages of one project.",
+      "required": ["--project"],
+      "flags": {
+        "--project": "Numeric project ID or project identifier (slug from `sprintly projects`)",
+        "--limit": "Page size (default 25)",
+        "--offset": "Skip first N pages"
+      },
+      "notes": "Pagination is client-side; the wiki index endpoint does not return total_count, so there is no --all flag.",
+      "example": "sprintly wiki list --project spr"
+    },
+    "wiki show": {
+      "purpose": "Show a wiki page by title.",
+      "required": ["--project", "--title"],
+      "flags": {
+        "--project": "Numeric project ID or project identifier",
+        "--title": "Page name. The backend addresses wiki pages by title only; numeric IDs are not supported.",
+        "--version": "Specific historical revision (default: current)",
+        "--with-attachments": "Include attachment metadata table",
+        "--format": "raw|rendered. 'rendered' is a forward-compat placeholder and currently behaves like 'raw'."
+      },
+      "errors": "Missing title returns a clear not-found error via describeBackendError; spaces in title are URL-encoded automatically.",
+      "example": "sprintly wiki show --project spr --title 'Release notes'"
+    },
+    "wiki edit": {
+      "purpose": "Upsert a wiki page by title — one command for both create and update.",
+      "required": ["--project", "--title"],
+      "flags": {
+        "--project": "Numeric project ID or project identifier",
+        "--title": "Page name (primary key for wiki pages)",
+        "--text": "Inline body. Mutually exclusive with --text-file and --text-stdin.",
+        "--text-file": "Read body from file. Mutually exclusive with --text and --text-stdin.",
+        "--text-stdin": "Read body from stdin. Mutually exclusive with --text and --text-file.",
+        "--parent": "Parent page title (sets parent_title on the page)",
+        "--comments": "Revision note attached to this edit"
+      },
+      "notes": "PUT without text is valid when you only want to change --parent or attach --comments to an existing page. Body follows the same primitive-HTML rule as --description/--notes.",
+      "example": "sprintly wiki edit --project spr --title 'Release notes' --text '<p>Shipped #54.</p>' --comments 'ship note'"
+    }
+  },
+  "text_format": {
+    "applies_to": [
+      "--description",
+      "--notes",
+      "description key inside --json-stdin / --json-file payloads"
+    ],
+    "rule": "Human-readable text wrapped in primitive HTML tags. Plain unmarked text and Markdown are both wrong: Markdown (**bold**, # heading, backticks, - list) renders as raw syntax in the web UI.",
+    "allowed_tags": ["h2", "h3", "p", "b", "i", "ul", "ol", "li", "code", "pre", "br"],
+    "disallowed": ["CSS styles", "classes", "scripts", "iframes", "tables (no <table>)", "Markdown syntax", "Textile syntax"],
+    "examples": {
+      "good_note": "<p>Picking this up.</p>",
+      "good_summary": "<h3>Shipped</h3><ul><li>Skill under <code>.claude/skills/sprintly/</code></li><li>Smoke test on <code>#53</code></li></ul>",
+      "bad_markdown": "**Shipped**\n- Skill\n- Smoke test",
+      "bad_plain": "shipped: skill, smoke test"
+    }
+  },
+  "cf_syntax": {
+    "form": "--cf <field_id>=<value>",
+    "repeat_same_id_for_multi_value": true,
+    "discover_via": "sprintly custom-fields [--project ID] [--type ID]"
+  },
+  "story_workflow": {
+    "rule": "When implementing a story that has sub-tasks, keep the sprintly tracker in sync at all times. The in-session task list is invisible to the user later; only journal notes and statuses on sub-tasks survive.",
+    "applies_even_without_user_ask": true,
+    "find_sub_tasks": "sprintly issue list --parent N --status '*' --columns id,status,subject --limit 100",
+    "per_sub_task": [
+      {
+        "phase": "before_starting",
+        "action": "Transition to in progress (status 2; verify with `sprintly statuses`).",
+        "example": "sprintly issue update --id 41 --status 2"
+      },
+      {
+        "phase": "while_working",
+        "action": "If you hit a blocker, scope change, or split a sub-task, leave a --notes entry explaining why. Do not rely on memory or the in-session task list."
+      },
+      {
+        "phase": "on_completion",
+        "action": "Transition to Done (status 3) AND post a short --notes summary: files/functions touched, decisions made, verification results. Do not paste diffs.",
+        "example": "sprintly issue update --id 41 --status 3 --notes \"<p>Added User in Cli.Backend; admin is Maybe Bool so the client-side filter degrades cleanly.</p>\""
+      }
+    ],
+    "parent_story": "When the story itself is finished, post a summary note on the parent issue, but do not auto-transition the parent unless the user explicitly asks. Let them choose review/testing/done.",
+    "why": "The sprintly journal is the only artefact the user can read tomorrow to understand what shipped and why. Skipping it leaves the board lying — sub-tasks stuck in `to do` while their code is merged."
+  },
+  "known_gaps": [
+    {
+      "id": "no-delete",
+      "summary": "There is no issue delete command.",
+      "workaround": "Close the issue by setting --status to the Done ID from `sprintly statuses`."
+    },
+    {
+      "id": "no-comment-command",
+      "summary": "No standalone comment subcommand.",
+      "workaround": "Use `issue update --id N --notes \"…\"` to add a journal entry."
+    }
+  ],
+  "files": {
+    "skill_markdown": "SKILL.md",
+    "recipes": "recipes.md",
+    "readme": "README.md"
+  }
+}
