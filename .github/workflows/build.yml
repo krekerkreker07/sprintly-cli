@@ -12,14 +12,27 @@
 #
 # Trigger from GitLab CI:
 #   POST /repos/<owner>/<repo>/actions/workflows/build.yml/dispatches
-#     body: {"ref":"main","inputs":{"ref":"<SHA-or-tag>","make_release":"true"}}
+#     body: {"ref":"main","inputs":{"ref":"<SHA-or-tag>"}}
 #
-# Versioning:
-#   Source of truth — `version:` у sprintlycli.cabal. CI читає його,
-#   зашиває у назви артефактів (`sprintly-<VER>-<platform>`) і у бінарник
-#   (через -DBUILD_SHA="<short-sha>" — команда `sprintly version` друкує обидва).
-#   При make_release=true CI вимагає, щоб release_tag дорівнював `v<cabal version>`,
-#   інакше fail — це не дає опублікувати реліз з неузгодженою версією.
+# Versioning + release logic (повністю автоматичні; обидві базуються на
+# `version:` полі у sprintlycli.cabal):
+#   • 3 components (e.g. `0.2.0`)   → stable release, GitHub tag `0.2.0`,
+#       marked as the repo's latest release.
+#   • 4 components (e.g. `0.2.0.1`) → prerelease, GitHub tag `0.2.0.1` (PVP
+#       форма як є, без мапінгу у SemVer `-rc.N`), позначається prerelease,
+#       latest НЕ чіпає.
+#   • Git tag збігається з cabal version байт-у-байт (без `v`-префіксу) — це
+#     спрощує співставлення артефактів `sprintly-<VER>-<platform>` з тегом.
+#   • Cabal не дозволяє літерних суфіксів (`-rc`, `-SNAPSHOT`) у `version:`
+#     через PVP, тому prerelease маркуємо суто 4-м числовим компонентом.
+#   • Якщо GitHub release з обчисленим тегом уже існує — workflow ТІЛЬКИ
+#     збирає артефакти й не публікує нічого. Це робить безпечним повторний
+#     прогін після фейлу одного таргета, і єдиним тригером нового релізу
+#     стає бамп `version:` у cabal.
+#
+# CI зашиває cabal version у назви артефактів (`sprintly-<VER>-<platform>`)
+# і у бінарник через -DBUILD_SHA="<short-sha>" (команда `sprintly version`
+# друкує обидва).
 #
 # Architecture note: Linux jobs run on the GitHub-hosted host (ubuntu-*) WITHOUT
 # a `container:` block, then `docker run` the benz0li/ghc-musl image only for
@@ -37,14 +50,6 @@ on:
         description: 'GitLab git ref to build (SHA, tag, or branch)'
         required: true
         default: 'main'
-      make_release:
-        description: 'Create a GitHub Release with all artifacts'
-        required: false
-        default: 'false'
-      release_tag:
-        description: 'Tag name for the GitHub Release (defaults to inputs.ref)'
-        required: false
-        default: ''
 
 env:
   GHC_VERSION: '9.8.2'
@@ -65,11 +70,15 @@ jobs:
   # Окремий job, щоб усі білди читали ту саму версію й ту саму перевірку
   # тег↔cabal проходили один раз. matrix job-и беруть value через `needs.prep`.
   prep:
-    name: prepare (read version, validate)
+    name: prepare (read version, decide release)
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.cabal.outputs.version }}
       sha: ${{ steps.cabal.outputs.sha }}
+      tag: ${{ steps.meta.outputs.tag }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+      should_release: ${{ steps.meta.outputs.should_release }}
+      release_name: ${{ steps.meta.outputs.release_name }}
     steps:
       - name: Clone source from GitLab
         shell: bash
@@ -96,29 +105,50 @@ jobs:
           echo "Cabal version: ${VERSION}"
           echo "Build SHA: ${SHA}"
 
-      - name: Validate release tag matches cabal version
-        if: inputs.make_release == 'true'
+      - name: Detect release channel + existing release
+        id: meta
         shell: bash
         env:
+          # GH_TOKEN потрібен для `gh release view` (read-only). Стандартний
+          # GITHUB_TOKEN runner-а має достатньо прав на public+private repos.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.cabal.outputs.version }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
-          REF: ${{ inputs.ref }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          TAG="${RELEASE_TAG:-$REF}"
-          # Дозволяємо `v0.2.0`, `0.2.0`, або `v0.2.0.0` ≡ `0.2.0` (cabal-стиль)
-          NORM_TAG="${TAG#v}"
-          if [ "${NORM_TAG}" != "${VERSION}" ]; then
-            echo "::error::Release tag '${TAG}' (normalized: '${NORM_TAG}') does not match cabal version '${VERSION}'."
-            echo "::error::Bump 'version:' у sprintlycli.cabal або перетегніть."
+          # Конвенція проєкту (див. header workflow):
+          #   N.N.N   → stable,     tag <version>, latest=true
+          #   N.N.N.M → prerelease, tag <version> (PVP як є), latest=false
+          # Tag без `v`-префіксу — щоб збігався з cabal version байт-у-байт
+          # і з версією у назвах артефактів.
+          # Будь-яка інша форма — помилка (заборонено, аби випадково не
+          # зробити несумісну з cabal версію типу `0.2.0-rc`).
+          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            IS_PRE=true
+          elif [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            IS_PRE=false
+          else
+            echo "::error::Cabal version '$VERSION' must match N.N.N (stable) or N.N.N.M (prerelease)."
             exit 1
           fi
-          # Перевірка SemVer-формату самого тегу.
-          if ! echo "${NORM_TAG}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?(-[A-Za-z0-9.-]+)?$'; then
-            echo "::error::Tag '${TAG}' is not valid SemVer (e.g. v0.2.0)."
-            exit 1
+          TAG="${VERSION}"
+          RELEASE_NAME="sprintly ${TAG}"
+          # Якщо release з таким tag уже опубліковано — skip publish; build
+          # все одно відбудеться (це дозволяє повторний прогін після фейлу
+          # одного таргета, не створюючи дубль-релізу).
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            SHOULD_RELEASE=false
+            echo "::notice::Release $TAG already exists — building artifacts only, no publish."
+          else
+            SHOULD_RELEASE=true
+            echo "::notice::Will publish $TAG (prerelease=$IS_PRE)."
           fi
-          echo "✓ Release tag '${TAG}' matches cabal version '${VERSION}'."
+          {
+            echo "tag=$TAG"
+            echo "is_prerelease=$IS_PRE"
+            echo "should_release=$SHOULD_RELEASE"
+            echo "release_name=$RELEASE_NAME"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     needs: prep
@@ -139,9 +169,16 @@ jobs:
           - target: macos-arm64
             os: macos-14
             kind: native
+          # macos-13 — нативний Intel runner (не Apple Silicon + Rosetta).
+          # Це позбавляє нас 15-хвилинного bootstrap ghcup через Rosetta-
+          # переклад і вирівнює macos-x86_64 з рештою native-таргетів
+          # (один Setup-крок, один Build-крок, спільний кеш-шаблон).
+          # Caveat: GitHub поступово виводить Intel runners (macos-12 вже
+          # знятий). Якщо в майбутньому macos-13 теж приберуть — доведеться
+          # повернутися до Rosetta або викинути x86_64 таргет.
           - target: macos-x86_64
-            os: macos-14
-            kind: macos-rosetta
+            os: macos-13
+            kind: native
 
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -232,98 +269,7 @@ jobs:
           ls -lh out/
           file "out/${ARTIFACT}" || true
 
-      # ---- macOS Intel (Rosetta 2 on a macos-14 M1 runner) --------------------
-      # Кеш ghcup-тулчейну (GHC + cabal бінарі під x86_64). Без нього кожен
-      # прогін тратить 5–10 хв на завантаження + установку GHC через ghcup.
-      # Ключ містить версії GHC/Cabal, щоб їх бамп інвалідував кеш автоматично.
-      - name: Cache ghcup toolchain (macos-rosetta)
-        if: matrix.kind == 'macos-rosetta'
-        id: ghcup-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.ghcup
-          key: ghcup-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}
-
-      - name: Install x86_64 toolchain via Rosetta
-        if: matrix.kind == 'macos-rosetta'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # macos-14 runners ship with Rosetta 2 pre-installed; ensure anyway.
-          softwareupdate --install-rosetta --agree-to-license 2>/dev/null || true
-          # Якщо кеш ~/.ghcup відновлено — пропускаємо `curl | sh`, який щоразу
-          # стягує і інсталяцію tarball-ів. Це найбільша економія для цього job-у.
-          if [ -x "$HOME/.ghcup/bin/ghc" ] && [ -x "$HOME/.ghcup/bin/cabal" ]; then
-            echo "ghcup toolchain restored from cache; skipping bootstrap"
-            arch -x86_64 "$HOME/.ghcup/bin/ghc" --version
-            arch -x86_64 "$HOME/.ghcup/bin/cabal" --version
-            exit 0
-          fi
-          # Install x86_64 GHC + cabal into ~/.ghcup. When run under Rosetta,
-          # ghcup downloads the darwin-x86_64 distribution.
-          arch -x86_64 /bin/bash <<EOF
-          set -eu
-          curl --proto '=https' --tlsv1.2 -sSf https://get-ghcup.haskell.org | \
-            BOOTSTRAP_HASKELL_NONINTERACTIVE=1 \
-            BOOTSTRAP_HASKELL_INSTALL_NO_STACK=1 \
-            BOOTSTRAP_HASKELL_INSTALL_HLS= \
-            BOOTSTRAP_HASKELL_GHC_VERSION=${GHC_VERSION} \
-            BOOTSTRAP_HASKELL_CABAL_VERSION=${CABAL_VERSION} \
-            BOOTSTRAP_HASKELL_ADJUST_BASHRC= \
-            sh
-          export PATH="\$HOME/.ghcup/bin:\$PATH"
-          ghc --version
-          cabal --version
-          EOF
-
-      - name: Cache cabal store (macos-rosetta)
-        if: matrix.kind == 'macos-rosetta'
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cabal/store
-            ~/.cabal/packages
-            dist-newstyle
-          key: cabal-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}-${{ hashFiles('sprintlycli.cabal') }}
-          restore-keys: |
-            cabal-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}-
-            cabal-${{ matrix.target }}-
-
-      - name: Build (macos-rosetta)
-        if: matrix.kind == 'macos-rosetta'
-        shell: bash
-        env:
-          ARTIFACT: ${{ steps.name.outputs.artifact }}
-        run: |
-          set -euo pipefail
-          mkdir -p out
-          # Quoted heredoc (`<<'EOF'`) забороняє host-shell expansion. Усі
-          # змінні (BUILD_SHA, COMMON_GHC_OPTS, ARTIFACT) читаються з env
-          # ВНУТРІШНІМ bash-ом — це уникає подвійного escape lapok через
-          # два рівні shell-парсингу (host → arch-x86_64 bash), на якому
-          # раніше -DBUILD_SHA розгортався без лапок і ламав CPP.
-          arch -x86_64 /bin/bash <<'EOF'
-          set -eu
-          export PATH="$HOME/.ghcup/bin:$PATH"
-          cabal update
-          # Один рівень escape: `\"` всередині "..."-string дає буквальну `"`,
-          # після cabal-stripping одного рівня лапок GHC побачить
-          # `-DBUILD_SHA="<sha>"` — рядковий літерал, як треба CPP.
-          SHA_OPT="-DBUILD_SHA=\"\\\"${BUILD_SHA}\\\"\""
-          # macOS ld64 → -dead_strip (аналог --gc-sections для Mach-O).
-          LD_GC_OPT="-optl-Wl,-dead_strip"
-          cabal build exe:sprintly \
-            --ghc-options="${COMMON_GHC_OPTS}" \
-            --ghc-options="${LD_GC_OPT}" \
-            --ghc-options="${SHA_OPT}"
-          bin=$(cabal list-bin exe:sprintly)
-          cp "$bin" "out/${ARTIFACT}"
-          strip "out/${ARTIFACT}" || true
-          EOF
-          ls -lh out/
-          file "out/${ARTIFACT}" || true
-
-      # ---- Ad-hoc codesign for macOS (both native arm64 and Rosetta x86_64) --
+      # ---- Ad-hoc codesign for macOS (both native arm64 and Intel x86_64) ----
       # Без підпису macOS відмовляється запускати скачаний бінарник з
       # "killed: 9" / "is damaged" (особливо на Apple Silicon). Ad-hoc підпис
       # (-s -) не вимагає AppleID акаунту, але дає бінарнику валідний embedded
@@ -334,7 +280,7 @@ jobs:
       # --options=runtime (hardened runtime) додаємо одразу: якщо колись
       # додамо notarization, hardened runtime для неї обов'язковий.
       - name: Ad-hoc codesign (macOS)
-        if: (matrix.kind == 'native' && startsWith(matrix.target, 'macos')) || matrix.kind == 'macos-rosetta'
+        if: matrix.kind == 'native' && startsWith(matrix.target, 'macos')
         shell: bash
         env:
           ARTIFACT: ${{ steps.name.outputs.artifact }}
@@ -410,7 +356,9 @@ jobs:
   release:
     name: GitHub Release
     needs: [prep, build]
-    if: inputs.make_release == 'true'
+    # Реліз публікуємо лише якщо prep вирішив, що це нова версія. Інакше
+    # job просто скіпається (артефакти вже завантажені у попередніх job-ах).
+    if: needs.prep.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -435,27 +383,40 @@ jobs:
           cp src/scripts/uninstall.sh dist/uninstall.sh
           chmod +x dist/install.sh dist/uninstall.sh
 
+      - name: Write version manifest
+        shell: bash
+        env:
+          VERSION: ${{ needs.prep.outputs.version }}
+        run: |
+          set -euo pipefail
+          # plain-text ассет для ендпоінту GET /latest/version проксі-хосту:
+          # get.sprintly.cloud стрімить releases/latest/download/version. Через
+          # latest-флаг GitHub (make_latest нижче) цей файл завжди = останній
+          # СТАБІЛЬНИЙ реліз, що збігається з default-ом resolve_version у install.sh.
+          printf '%s\n' "${VERSION}" > dist/version
+          cat dist/version
+
       - name: Compute checksums
         run: |
           cd dist
-          # install.sh / uninstall.sh теж потрапляють у SHA256SUMS.txt — корисно
-          # для аудиту, навіть якщо звичайний користувач тягне їх через curl|sh.
+          # install.sh / uninstall.sh / version теж потрапляють у SHA256SUMS.txt —
+          # корисно для аудиту, навіть якщо звичайний користувач тягне їх через curl|sh.
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
           ls -lh
 
-      - name: Pick release tag
-        id: tag
-        run: |
-          tag="${{ inputs.release_tag }}"
-          if [ -z "$tag" ]; then tag="${{ inputs.ref }}"; fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: sprintly ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ needs.prep.outputs.tag }}
+          name: ${{ needs.prep.outputs.release_name }}
+          # prerelease=true для 4-component cabal version (N.N.N.M).
+          # make_latest виставляємо ЯВНО протилежним: stable → latest=true,
+          # prerelease → latest=false. Без явного make_latest GitHub може
+          # автоматично підняти release у latest за semver, що для prerelease
+          # було б некоректно.
+          prerelease: ${{ needs.prep.outputs.is_prerelease }}
+          make_latest: ${{ needs.prep.outputs.is_prerelease == 'true' && 'false' || 'true' }}
           generate_release_notes: false
           fail_on_unmatched_files: true
           files: |
@@ -466,4 +427,5 @@ jobs:
             dist/sprintly-${{ env.VERSION }}-macos-x86_64
             dist/install.sh
             dist/uninstall.sh
+            dist/version
             dist/SHA256SUMS.txt
