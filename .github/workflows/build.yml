@@ -169,16 +169,15 @@ jobs:
           - target: macos-arm64
             os: macos-14
             kind: native
-          # macos-13 — нативний Intel runner (не Apple Silicon + Rosetta).
-          # Це позбавляє нас 15-хвилинного bootstrap ghcup через Rosetta-
-          # переклад і вирівнює macos-x86_64 з рештою native-таргетів
-          # (один Setup-крок, один Build-крок, спільний кеш-шаблон).
-          # Caveat: GitHub поступово виводить Intel runners (macos-12 вже
-          # знятий). Якщо в майбутньому macos-13 теж приберуть — доведеться
-          # повернутися до Rosetta або викинути x86_64 таргет.
+          # x86_64 macOS збираємо через Rosetta 2 на Apple Silicon runner-і:
+          # нативні Intel runners (macos-13) більше недоступні для public
+          # репо безкоштовно, а cross-compile з arm64 → x86_64 у GHC поки
+          # потребує custom toolchain. Bootstrap ghcup під Rosetta дорогий
+          # (~15 хв), тому окремо кешуємо ~/.ghcup розділеним
+          # restore+save-патерном (див. нижче).
           - target: macos-x86_64
-            os: macos-13
-            kind: native
+            os: macos-14
+            kind: macos-rosetta
 
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -269,7 +268,130 @@ jobs:
           ls -lh out/
           file "out/${ARTIFACT}" || true
 
-      # ---- Ad-hoc codesign for macOS (both native arm64 and Intel x86_64) ----
+      # ---- macOS Intel via Rosetta 2 on macos-14 (Apple Silicon) host --------
+      # Кеш-стратегія: ОКРЕМИЙ restore і save для ~/.ghcup, щоб збереження
+      # відбувалося ОДРАЗУ після успішного bootstrap, а не як post-step
+      # цілого job-у. Інакше будь-який фейл build-кроку → cache.save не
+      # викликається → наступний прогін знову платить 15 хв за bootstrap.
+      # Це самозакріплюваний фейл-стан: коли кеш найпотрібніший (відлагодження),
+      # його якраз і нема. Розділений restore+save цей цикл розриває.
+      - name: Restore ghcup toolchain cache (macos-rosetta)
+        if: matrix.kind == 'macos-rosetta'
+        id: ghcup-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ghcup
+          key: ghcup-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}
+
+      - name: Install x86_64 toolchain via Rosetta
+        if: matrix.kind == 'macos-rosetta'
+        id: ghcup-install
+        shell: bash
+        run: |
+          set -euo pipefail
+          # macos-14 runners ship with Rosetta 2 pre-installed; ensure anyway.
+          softwareupdate --install-rosetta --agree-to-license 2>/dev/null || true
+          # Якщо кеш ~/.ghcup відновлено — пропускаємо `curl | sh`, який щоразу
+          # стягує і інсталяцію tarball-ів. Це найбільша економія для цього job-у.
+          if [ -x "$HOME/.ghcup/bin/ghc" ] && [ -x "$HOME/.ghcup/bin/cabal" ]; then
+            echo "ghcup toolchain restored from cache; skipping bootstrap"
+            arch -x86_64 "$HOME/.ghcup/bin/ghc" --version
+            arch -x86_64 "$HOME/.ghcup/bin/cabal" --version
+            exit 0
+          fi
+          # Install x86_64 GHC + cabal into ~/.ghcup. When run under Rosetta,
+          # ghcup downloads the darwin-x86_64 distribution.
+          arch -x86_64 /bin/bash <<EOF
+          set -eu
+          curl --proto '=https' --tlsv1.2 -sSf https://get-ghcup.haskell.org | \
+            BOOTSTRAP_HASKELL_NONINTERACTIVE=1 \
+            BOOTSTRAP_HASKELL_INSTALL_NO_STACK=1 \
+            BOOTSTRAP_HASKELL_INSTALL_HLS= \
+            BOOTSTRAP_HASKELL_GHC_VERSION=${GHC_VERSION} \
+            BOOTSTRAP_HASKELL_CABAL_VERSION=${CABAL_VERSION} \
+            BOOTSTRAP_HASKELL_ADJUST_BASHRC= \
+            sh
+          export PATH="\$HOME/.ghcup/bin:\$PATH"
+          ghc --version
+          cabal --version
+          EOF
+
+      # Зберігаємо кеш ghcup ОДРАЗУ, не post-step. Дві умови:
+      #   1) cache-hit != 'true' — нема сенсу save при відновленому кеші
+      #      (key уже зайнятий, save став би no-op з warning'ом);
+      #   2) install.outcome == 'success' — щоб не зберегти напіврозпакований
+      #      ghcup, якщо bootstrap впав посередині (напр. мережа).
+      - name: Save ghcup toolchain cache (macos-rosetta)
+        if: matrix.kind == 'macos-rosetta' && steps.ghcup-cache.outputs.cache-hit != 'true' && steps.ghcup-install.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ghcup
+          key: ghcup-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}
+
+      - name: Restore cabal store cache (macos-rosetta)
+        if: matrix.kind == 'macos-rosetta'
+        id: cabal-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cabal/store
+            ~/.cabal/packages
+            dist-newstyle
+          key: cabal-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}-${{ hashFiles('sprintlycli.cabal') }}
+          restore-keys: |
+            cabal-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}-
+            cabal-${{ matrix.target }}-
+
+      - name: Build (macos-rosetta)
+        if: matrix.kind == 'macos-rosetta'
+        id: build-rosetta
+        shell: bash
+        env:
+          ARTIFACT: ${{ steps.name.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # Quoted heredoc (`<<'EOF'`) забороняє host-shell expansion. Усі
+          # змінні (BUILD_SHA, COMMON_GHC_OPTS, ARTIFACT) читаються з env
+          # ВНУТРІШНІМ bash-ом — це уникає подвійного escape lapok через
+          # два рівні shell-парсингу (host → arch-x86_64 bash), на якому
+          # раніше -DBUILD_SHA розгортався без лапок і ламав CPP.
+          arch -x86_64 /bin/bash <<'EOF'
+          set -eu
+          export PATH="$HOME/.ghcup/bin:$PATH"
+          cabal update
+          # Один рівень escape: `\"` всередині "..."-string дає буквальну `"`,
+          # після cabal-stripping одного рівня лапок GHC побачить
+          # `-DBUILD_SHA="<sha>"` — рядковий літерал, як треба CPP.
+          SHA_OPT="-DBUILD_SHA=\"\\\"${BUILD_SHA}\\\"\""
+          # macOS ld64 → -dead_strip (аналог --gc-sections для Mach-O).
+          LD_GC_OPT="-optl-Wl,-dead_strip"
+          cabal build exe:sprintly \
+            --ghc-options="${COMMON_GHC_OPTS}" \
+            --ghc-options="${LD_GC_OPT}" \
+            --ghc-options="${SHA_OPT}"
+          bin=$(cabal list-bin exe:sprintly)
+          cp "$bin" "out/${ARTIFACT}"
+          strip "out/${ARTIFACT}" || true
+          EOF
+          ls -lh out/
+          file "out/${ARTIFACT}" || true
+
+      # Зберігаємо cabal-store навіть якщо build впав — store coherent на рівні
+      # окремих packages (кожна або повністю встановлена, або відсутня), тому
+      # часткова збірка корисна для наступного прогону. Умова `always()`
+      # перебиває default skip-on-prior-failure.
+      - name: Save cabal store cache (macos-rosetta)
+        if: matrix.kind == 'macos-rosetta' && always() && steps.cabal-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cabal/store
+            ~/.cabal/packages
+            dist-newstyle
+          key: cabal-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}-${{ hashFiles('sprintlycli.cabal') }}
+
+      # ---- Ad-hoc codesign for macOS (native arm64 + Rosetta x86_64) ---------
       # Без підпису macOS відмовляється запускати скачаний бінарник з
       # "killed: 9" / "is damaged" (особливо на Apple Silicon). Ad-hoc підпис
       # (-s -) не вимагає AppleID акаунту, але дає бінарнику валідний embedded
@@ -280,7 +402,7 @@ jobs:
       # --options=runtime (hardened runtime) додаємо одразу: якщо колись
       # додамо notarization, hardened runtime для неї обов'язковий.
       - name: Ad-hoc codesign (macOS)
-        if: matrix.kind == 'native' && startsWith(matrix.target, 'macos')
+        if: (matrix.kind == 'native' && startsWith(matrix.target, 'macos')) || matrix.kind == 'macos-rosetta'
         shell: bash
         env:
           ARTIFACT: ${{ steps.name.outputs.artifact }}
