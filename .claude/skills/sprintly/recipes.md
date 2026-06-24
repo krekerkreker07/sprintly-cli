@@ -41,6 +41,8 @@ sprintly statuses
 # Then transition with a short HTML summary
 sprintly issue update --id 39 --status 6 --notes \
   "<p>Done, please review.</p><ul><li>Skill files under <code>.claude/skills/sprintly/</code></li><li>Smoke test green</li></ul>"
+# Verify the note landed by reading the issue's comments back
+sprintly issue show 39 --comments
 ```
 
 ## 5. Batch-create from JSON

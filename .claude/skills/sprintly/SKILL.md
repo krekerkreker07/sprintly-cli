@@ -66,12 +66,17 @@ One-line purpose + minimal example per subcommand. Run any command with `--help`
 - `version` — print CLI version.
 - `update` — self-update the CLI binary from `get.sprintly.cloud`. No flags. Refuses when the binary is not at `$SPRINTLY_HOME/bin/sprintly` (default `~/.sprintly/bin/sprintly`). Honours `SPRINTLY_BASE_URL` for symmetry with the installer.
 
-### `issue show ISSUE_ID`
+### `issue show ISSUE_ID [--comments]`
 
-Pretty-print one issue with header, dates, and custom fields.
+Pretty-print one issue with header, dates, and custom fields. Pass
+`--comments` to also list the issue comments (journal notes) after the
+custom-fields block: each entry shows author, timestamp, an optional
+`[private]` marker, and the note body. Pure field-change history entries are
+omitted — only entries with an actual comment are shown.
 
 ```bash
 sprintly issue show 39
+sprintly issue show 39 --comments
 ```
 
 ### `issue list`

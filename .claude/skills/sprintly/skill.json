@@ -26,7 +26,10 @@
     "issue show": {
       "purpose": "Show full detail for one issue.",
       "required": ["ISSUE_ID"],
-      "example": "sprintly issue show 39"
+      "flags": {
+        "--comments": "Also list the issue comments (journal notes): author, timestamp, optional [private] marker, note body. Field-change-only history entries are omitted."
+      },
+      "example": "sprintly issue show 39 --comments"
     },
     "issue list": {
       "purpose": "Search and list issues with rich filtering.",
