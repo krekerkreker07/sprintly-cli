@@ -1,6 +1,6 @@
 {
   "name": "sprintly",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Drive the sprintly CLI for sprintly.cloud task tracking. LLM-agnostic mirror of SKILL.md.",
   "binary": {
     "preferred": "sprintly",
@@ -8,28 +8,116 @@
     "shell_resolver": "$(command -v sprintly || echo \"$HOME/.sprintly/bin/sprintly\")"
   },
   "auth": {
-    "session_path": "~/.sprintly/session",
+    "session_path": "~/.config/sprintly/config.json ($XDG_CONFIG_HOME/sprintly/config.json; %APPDATA%\\sprintly\\config.json on Windows), mode 0600, keys accessToken/refreshToken/kcBaseUrl",
     "login": "sprintly login --url <identity URL> [--headless]",
     "headless_trigger": "missing DISPLAY/WAYLAND_DISPLAY auto-selects the code-pairing prompt",
-    "logout_warning": "Run only when the user explicitly asks; revokes the saved session."
+    "logout_warning": "Run only when the user explicitly asks; revokes the saved session.",
+    "session_path_note": "~/.sprintly/ holds only the installed binary and shell completions — no credentials there.",
+    "token_for_rest": "`sprintly token` refreshes the session and prints a valid access token on stdout (one line, nothing else; diagnostics go to stderr). Use it for REST calls the CLI does not cover: curl -H \"Authorization: Bearer $(sprintly token)\". Never read accessToken out of config.json by hand — tokens live ~5 minutes, so a hand-read value is often already expired and the 401 surfaces as a parse error."
   },
   "lookups": [
-    {"command": "projects", "returns": "project IDs, slug, name"},
-    {"command": "statuses", "returns": "status IDs with closed flag"},
-    {"command": "priorities", "returns": "priority IDs"},
-    {"command": "types", "returns": "issue type IDs"},
-    {"command": "activities", "returns": "work-activity IDs"},
-    {"command": "sprints --project ID", "returns": "sprint IDs per project"},
-    {"command": "custom-fields [--type ID] [--project ID]", "returns": "custom field definitions and value sets"}
+    {
+      "command": "projects",
+      "returns": "project IDs, slug, name"
+    },
+    {
+      "command": "statuses",
+      "returns": "status IDs with closed flag"
+    },
+    {
+      "command": "priorities",
+      "returns": "priority IDs"
+    },
+    {
+      "command": "types",
+      "returns": "issue type IDs"
+    },
+    {
+      "command": "activities",
+      "returns": "work-activity IDs"
+    },
+    {
+      "command": "sprints --project ID",
+      "returns": "sprint IDs per project"
+    },
+    {
+      "command": "custom-fields [--type ID] [--project ID]",
+      "returns": "custom field definitions and value sets; the full dictionary is admin-only, otherwise the command explains that on stderr and falls back to deriving fields from values present on issues (POSSIBLE VALUES = values in use, not the allowed set; FORMAT/REQ unknown)"
+    },
+    {
+      "command": "users --project ID",
+      "returns": "member IDs and names of one project; works without admin rights (reads project memberships)"
+    }
   ],
+  "output_format": {
+    "flag": "--json",
+    "available_on": "every command that prints data: projects, statuses, priorities, types, activities, sprints, custom-fields, users, issue create|update|show|list, wiki list|show|edit, attachment download",
+    "not_available_on": [
+      "login",
+      "logout",
+      "update",
+      "version"
+    ],
+    "shape": "Collection -> JSON array; single resource -> JSON object. No envelope, so .[] iterates a list.",
+    "keys": "camelCase, named after the CLI flag vocabulary (type, sprint, assignee, doneRatio, customFields) rather than the wire format of the API underneath. This is the CLI contract, so it is stable across backend renames.",
+    "prefer_when": "Always prefer --json over parsing tables when you are going to act on the values.",
+    "write_commands": "issue create --json prints the created issue (read .id); issue update --json and wiki edit --json print a confirmation object, because those calls return no body. attachment upload --json is the one envelope: {\"issue\",\"count\",\"uploaded\":[{\"id\",\"filename\",\"filesize\",\"contentType\"}]} — read new attachment ids from .uploaded[].id.",
+    "table_cells": "Table output collapses line breaks inside a cell to spaces, and cuts the free-text columns (description, cf:<id>) at 120 characters with a trailing \"…\". Reference-data tables are never truncated. Both are display concessions — read values you intend to use via --json or issue show --field.",
+    "single_field": {
+      "form": "sprintly issue show ISSUE_ID --field NAME [--raw] [--json]",
+      "purpose": "Print one field value on stdout with no labels, padding or terminator — the read half of a read-modify-write loop over a text field.",
+      "names": "Same names as `issue list --columns` (id, subject, description, project, type, status, priority, author, assignee, category, sprint, parent, start-date, due-date, done-ratio, estimated-hours, is-private, created, updated, cf:<id>) plus comments and attachments.",
+      "plain_semantics": "Strings print without quotes; an unset field prints nothing; objects and arrays print as compact JSON.",
+      "raw_flag": "--raw drops the trailing newline so stdout equals the value byte for byte. Requires --field; on its own it is an error.",
+      "json_flag": "With --json the same single value is printed as a typed JSON value.",
+      "example": "sprintly issue show 244 --field description --raw > body.html"
+    },
+    "comment_metadata": "Comment bodies come back clean: the CLI strips the internal <!--jmeta:{...}--> prefix the web client stores inside journal notes, and hides entries the metadata marks as deleted. Do not handle that prefix yourself.",
+    "examples": [
+      "sprintly issue list --parent 161 --status '*' --json | jq -r '.[].id'",
+      "sprintly issue show 244 --json | jq -r .status.name",
+      "sprintly statuses --json | jq -r '.[] | select(.closed) | .name'"
+    ]
+  },
   "commands": {
     "issue show": {
-      "purpose": "Show full detail for one issue.",
-      "required": ["ISSUE_ID"],
+      "purpose": "Show full detail for one issue. When the issue has attachments, an Attachments block lists each one's ID, filename, size, type, author and date; use the ID with `attachment download`.",
+      "required": [
+        "ISSUE_ID"
+      ],
       "flags": {
-        "--comments": "Also list the issue comments (journal notes): author, timestamp, optional [private] marker, note body. Field-change-only history entries are omitted."
+        "--comments": "Also list the issue comments (journal notes): author, timestamp, optional [private] marker, note body. Field-change-only history entries are omitted.",
+        "--json": "Emit the issue as a JSON object instead of the pretty-printed block (see output_format)",
+        "--field": "Print only this field's value on stdout, with no labels or padding (see output_format.single_field)",
+        "--raw": "With --field: omit the trailing newline so stdout equals the value byte for byte"
       },
       "example": "sprintly issue show 39 --comments"
+    },
+    "attachment upload": {
+      "purpose": "Attach one or more local files to an issue — the only supported way to get a file INTO the tracker. Wraps the REST two-step (POST /api/uploads, then PUT /api/issues/<id> with an uploads array). All --file arguments land in ONE journal entry. The stored filename is computed once and reused for both steps: the backend verifies it on download, so a mismatch would surface as a 404 later rather than an error at upload time.",
+      "required": [
+        "--id ISSUE_ID",
+        "--file PATH"
+      ],
+      "flags": {
+        "--file": "File to attach; repeatable. A missing path is reported before any network call.",
+        "--content-type": "Content type applied to every --file; guessed from the extension by default.",
+        "--notes": "Comment posted together with the files. Primitive HTML, same rule as --description.",
+        "--filename": "Store under a different name; an error when combined with more than one --file.",
+        "--json": "{\"issue\",\"count\",\"uploaded\":[{\"id\",\"filename\",\"filesize\",\"contentType\"}]}"
+      },
+      "returns": "After upload the issue is re-read and the new attachment IDs are printed — those are the IDs `attachment download` expects.",
+      "example": "sprintly attachment upload --id 257 --file ./leads.csv --notes \"<p>Final list.</p>\""
+    },
+    "attachment download": {
+      "purpose": "Download the bytes of an issue attachment (e.g. a screenshot). Fetches metadata first, so it works from just the ID. With no --output, writes to the attachment's original filename in the current directory.",
+      "required": [
+        "--id ATTACHMENT_ID"
+      ],
+      "flags": {
+        "--output": "Destination path; -o is the short form, and -o - streams the bytes to stdout"
+      },
+      "example": "sprintly attachment download --id 512 --output ./bug-repro.png"
     },
     "issue list": {
       "purpose": "Search and list issues with rich filtering.",
@@ -58,39 +146,87 @@
         "--all": "Walk every page until total_count"
       },
       "columns_available": [
-        "id", "subject", "project", "type", "status", "priority",
-        "author", "assignee", "category", "sprint", "parent",
-        "start-date", "due-date", "done-ratio", "estimated-hours",
-        "is-private", "created", "updated", "description"
+        "id",
+        "subject",
+        "project",
+        "type",
+        "status",
+        "priority",
+        "author",
+        "assignee",
+        "category",
+        "sprint",
+        "parent",
+        "start-date",
+        "due-date",
+        "done-ratio",
+        "estimated-hours",
+        "is-private",
+        "created",
+        "updated",
+        "description"
       ],
       "example": "sprintly issue list --assignee me --status open --sort updated_on:desc"
     },
     "issue create": {
       "purpose": "Create a new issue.",
-      "required": ["--project", "--type", "--subject"],
-      "body_flags": [
-        "--project", "--type", "--status", "--priority", "--subject", "--description",
-        "--category", "--sprint", "--assignee", "--parent",
-        "--is-private", "--no-is-private",
-        "--estimated-hours", "--start-date", "--due-date", "--done-ratio",
-        "--watcher", "--cf"
+      "required": [
+        "--project",
+        "--type",
+        "--subject"
       ],
-      "json_input": ["--json-file PATH", "--json-stdin"],
+      "body_flags": [
+        "--project",
+        "--type",
+        "--status",
+        "--priority",
+        "--subject",
+        "--description",
+        "--category",
+        "--sprint",
+        "--assignee",
+        "--parent",
+        "--is-private",
+        "--no-is-private",
+        "--estimated-hours",
+        "--start-date",
+        "--due-date",
+        "--done-ratio",
+        "--watcher",
+        "--cf"
+      ],
+      "json_input": [
+        "--json-file PATH",
+        "--json-stdin"
+      ],
       "json_semantics": "JSON provides the base body; CLI flags override individual fields.",
-      "example": "sprintly issue create --project 8 --type 1 --subject 'Smoke test' --sprint 8 --assignee 9 --priority 4"
+      "example": "sprintly issue create --project 8 --type 1 --subject 'Smoke test' --sprint 8 --assignee 9 --priority 4",
+      "flags": {
+        "--assignee": "ID | me | NAME. NAME is matched against project members: exact case-insensitive match first, then substring; zero or multiple matches are an error that lists the members. Note `issue list --assignee` takes ID|me only."
+      },
+      "gotchas": [
+        "A project may have required custom fields; omitting one fails with HTTP 422 (e.g. 'Release version cannot be blank' on spr, CF 67). Check custom-fields --project <ID> first.",
+        "--json prints the created issue as a flat object (no envelope): read .id directly."
+      ]
     },
     "issue update": {
       "purpose": "Update an existing issue and/or append a journal comment.",
-      "required": ["--id"],
+      "required": [
+        "--id"
+      ],
       "extra_flags": {
         "--notes": "Append a journal comment without otherwise mutating the issue",
         "--private-notes": "Mark the appended comment as private"
       },
-      "example": "sprintly issue update --id 39 --status 6 --notes 'Ready for review'"
+      "example": "sprintly issue update --id 39 --status 6 --notes 'Ready for review'",
+      "flags": {
+        "--assignee": "ID | me | NAME. NAME is matched against project members: exact case-insensitive match first, then substring; zero or multiple matches are an error that lists the members. Note `issue list --assignee` takes ID|me only."
+      }
     },
     "users": {
       "purpose": "List backend users with substring / status / group filters, pagination, and selectable columns. Used to look up a numeric user id when `me` does not apply (e.g. for --watcher).",
       "flags": {
+        "--project": "List members of one project instead of every account. Works WITHOUT admin rights; returns IDs and names only (--status/--group/--include do not apply). This is how to resolve a person to a numeric id when plain `users` answers 403.",
         "--name": "Substring search across login/mail/firstname/lastname",
         "--status": "active | locked | registered",
         "--group": "Numeric group ID",
@@ -105,7 +241,9 @@
     },
     "wiki list": {
       "purpose": "List wiki pages of one project.",
-      "required": ["--project"],
+      "required": [
+        "--project"
+      ],
       "flags": {
         "--project": "Numeric project ID or project identifier (slug from `sprintly projects`)",
         "--limit": "Page size (default 25)",
@@ -116,7 +254,10 @@
     },
     "wiki show": {
       "purpose": "Show a wiki page by title.",
-      "required": ["--project", "--title"],
+      "required": [
+        "--project",
+        "--title"
+      ],
       "flags": {
         "--project": "Numeric project ID or project identifier",
         "--title": "Page name. The backend addresses wiki pages by title only; numeric IDs are not supported.",
@@ -129,7 +270,10 @@
     },
     "wiki edit": {
       "purpose": "Upsert a wiki page by title — one command for both create and update.",
-      "required": ["--project", "--title"],
+      "required": [
+        "--project",
+        "--title"
+      ],
       "flags": {
         "--project": "Numeric project ID or project identifier",
         "--title": "Page name (primary key for wiki pages)",
@@ -147,11 +291,32 @@
     "applies_to": [
       "--description",
       "--notes",
-      "description key inside --json-stdin / --json-file payloads"
+      "description key inside --json-stdin / --json-file payloads",
+      "attachment upload --notes"
     ],
     "rule": "Human-readable text wrapped in primitive HTML tags. Plain unmarked text and Markdown are both wrong: Markdown (**bold**, # heading, backticks, - list) renders as raw syntax in the web UI.",
-    "allowed_tags": ["h2", "h3", "p", "b", "i", "ul", "ol", "li", "code", "pre", "br"],
-    "disallowed": ["CSS styles", "classes", "scripts", "iframes", "tables (no <table>)", "Markdown syntax", "Textile syntax"],
+    "allowed_tags": [
+      "h2",
+      "h3",
+      "p",
+      "b",
+      "i",
+      "ul",
+      "ol",
+      "li",
+      "code",
+      "pre",
+      "br"
+    ],
+    "disallowed": [
+      "CSS styles",
+      "classes",
+      "scripts",
+      "iframes",
+      "tables (no <table>)",
+      "Markdown syntax",
+      "Textile syntax"
+    ],
     "examples": {
       "good_note": "<p>Picking this up.</p>",
       "good_summary": "<h3>Shipped</h3><ul><li>Skill under <code>.claude/skills/sprintly/</code></li><li>Smoke test on <code>#53</code></li></ul>",
@@ -194,9 +359,24 @@
       "workaround": "Close the issue by setting --status to the Done ID from `sprintly statuses`."
     },
     {
+      "id": "attachment-download-json-stdout",
+      "summary": "`attachment download --json` cannot be combined with `--output -`: both would write to stdout.",
+      "workaround": "Write the file to a path and read the JSON report, or stream to stdout without --json."
+    },
+    {
       "id": "no-comment-command",
       "summary": "No standalone comment subcommand.",
-      "workaround": "Use `issue update --id N --notes \"…\"` to add a journal entry."
+      "workaround": "Use `issue update --id N --notes \"…\"`, or `attachment upload --notes \"…\"` when a file goes with it."
+    },
+    {
+      "id": "no-attachment-delete",
+      "summary": "There is no attachment delete command.",
+      "workaround": "DELETE /api/attachments/<id>.json with Authorization: Bearer $(sprintly token)."
+    },
+    {
+      "id": "admin-only-dictionaries",
+      "summary": "The full custom-field dictionary and the global user list are admin-only.",
+      "workaround": "`custom-fields` falls back to fields seen on issues; use `users --project ID` instead of plain `users`."
     }
   ],
   "files": {

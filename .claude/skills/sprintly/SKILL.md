@@ -21,11 +21,18 @@ Subsequent examples assume `sprintly` is reachable.
 
 ## 2. Authentication
 
-`sprintly` keeps a session file at `~/.sprintly/session` (mode 0600). Every command refreshes the token before calling the backend, so commands "just work" once the user has signed in.
+`sprintly` keeps its session in `$XDG_CONFIG_HOME/sprintly/config.json` — in practice `~/.config/sprintly/config.json` (mode 0600, keys `accessToken`, `refreshToken`, `kcBaseUrl`). On Windows it is `%APPDATA%\sprintly\config.json`. Every command refreshes the token before calling the backend, so commands "just work" once the user has signed in.
+
+Do not confuse that with `~/.sprintly/`, which holds only the installed binary and shell completions — no credentials.
 
 - If a command fails with `no saved session` or `invalid_grant`: ask the user to run `sprintly login --url <identity URL>`. Do not invent the URL — it is environment-specific.
 - Headless containers (no `DISPLAY` / `WAYLAND_DISPLAY`) automatically fall back to a code-pairing prompt. You can also force it with `sprintly login --url … --headless`.
 - Never run `sprintly logout` unless the user explicitly asks. It revokes the saved session and forces a fresh sign-in.
+- Need to call the REST API directly (something the CLI does not cover)? Use `sprintly token` — it refreshes the session and prints a valid access token on stdout, one line and nothing else. Do **not** read `accessToken` out of `config.json` by hand: tokens live ~5 minutes, so a value read directly from the file is often already expired, and the resulting `401` surfaces as a confusing parse error rather than an auth error.
+
+```bash
+curl -s -H "Authorization: Bearer $(sprintly token)" "$BASE/api/issues/42.json"
+```
 
 ## 3. Reference lookups
 
@@ -40,8 +47,50 @@ Most write actions need numeric IDs. List them once per session and reuse:
 | `sprintly types`                                 | Issue type IDs                       |
 | `sprintly activities`                            | Work-activity IDs                    |
 | `sprintly custom-fields [--project ID] [--type ID]` | Custom field IDs and value sets |
+| `sprintly users --project ID`                    | Member IDs + names of one project    |
 
-For `--assignee` / `--author` in `issue list`, the literal `me` resolves to the signed-in user. `issue create` and `issue update` also accept `--assignee me`. Other ID flags require numeric IDs.
+For `--assignee` / `--author` in `issue list`, the literal `me` resolves to the signed-in user — that command takes `ID|me` only. `issue create` and `issue update` go further and accept `ID|me|NAME`, where `NAME` is matched against the project members (exact case-insensitive match first, then substring; zero or multiple matches are an error that lists the members). Other ID flags require numeric IDs.
+
+The full custom-field dictionary is admin-only. Without admin rights `custom-fields` does not fail: it explains the situation on stderr and falls back to deriving the field list from the values already present on issues, narrowed by `--project`. Treat the `POSSIBLE VALUES` column from that fallback as *values currently in use*, not the full allowed set — and `FORMAT`/`REQ` as unknown. `--json` output stays clean either way.
+
+`users` without `--project` needs admin rights too; `users --project ID` reads project memberships instead and works for any member.
+
+## 3a. Machine-readable output
+
+Every command that prints data accepts `--json`: instead of an ASCII table you get one line of compact JSON on stdout. **Use it by default when you are going to act on the values** — parsing tables is brittle and the `description` column in particular is unusable, because issue bodies are multi-line HTML.
+
+```bash
+sprintly issue list --parent 161 --status '*' --json | jq -r '.[].id'
+sprintly issue show 244 --json | jq -r .status.name
+sprintly custom-fields --project 6 --json | jq -r '.[] | "\(.id) \(.name)"'
+```
+
+Shape: **collection → JSON array, single resource → JSON object.** No envelope, so `.[]` iterates. Keys are camelCase and match the CLI's flag vocabulary (`type`, `sprint`, `assignee`, `doneRatio`, `customFields`), not the wire format of the API underneath.
+
+On write commands `--json` is also available: `issue create --json` prints the created issue (read `.id` from it), while `issue update --json` and `wiki edit --json` print a confirmation object, because those calls return no body.
+
+The one exception to "no envelope" is `attachment upload --json`, which reports on a batch rather than a single resource: `{"issue", "count", "uploaded": [{"id", "filename", "filesize", "contentType"}]}`. Read the new attachment ids from `.uploaded[].id`.
+
+### Reading one field: `issue show ID --field NAME [--raw]`
+
+For the read-modify-write loop over a text field, ask for the field alone. There is nothing to strip and no format to agree on:
+
+```bash
+# Exact bytes of the description, no labels, no trailing newline:
+sprintly issue show 244 --field description --raw > body.html
+
+# Transform and write back:
+new=$(sprintly issue show 244 --field description --raw | sed 's/foo/bar/')
+sprintly issue update --id 244 --description "$new"
+```
+
+`--field` takes the same names as `issue list --columns` (`id`, `subject`, `description`, `project`, `type`, `status`, `priority`, `author`, `assignee`, `category`, `sprint`, `parent`, `start-date`, `due-date`, `done-ratio`, `estimated-hours`, `is-private`, `created`, `updated`, `cf:<id>`) plus `comments` and `attachments`.
+
+- Without `--json`: the value is printed as-is — strings without quotes, an unset field as empty output, objects/arrays as compact JSON.
+- `--raw` additionally drops the trailing newline (byte-for-byte). It requires `--field`; on its own it is an error.
+- With `--json`: the same single value as a typed JSON value.
+
+Comment bodies are already clean here: the CLI strips the internal `<!--jmeta:{…}-->` metadata prefix that the web client stores inside journal notes, and hides entries that the metadata marks as deleted. You never need to handle that prefix yourself.
 
 ## 4. Command cheatsheet
 
@@ -53,6 +102,8 @@ One-line purpose + minimal example per subcommand. Run any command with `--help`
   `sprintly login --url https://identity.example.com`
 - `logout [--local-only]` — revoke and delete the local session.
   `sprintly logout`
+- `token` — print a valid access token on stdout (one line, nothing else); diagnostics go to stderr.
+  `curl -H "Authorization: Bearer $(sprintly token)" …`
 
 ### Lookups
 
@@ -66,17 +117,80 @@ One-line purpose + minimal example per subcommand. Run any command with `--help`
 - `version` — print CLI version.
 - `update` — self-update the CLI binary from `get.sprintly.cloud`. No flags. Refuses when the binary is not at `$SPRINTLY_HOME/bin/sprintly` (default `~/.sprintly/bin/sprintly`). Honours `SPRINTLY_BASE_URL` for symmetry with the installer.
 
-### `issue show ISSUE_ID [--comments]`
+### `issue show ISSUE_ID [--comments] [--field NAME] [--raw] [--json]`
 
-Pretty-print one issue with header, dates, and custom fields. Pass
-`--comments` to also list the issue comments (journal notes) after the
-custom-fields block: each entry shows author, timestamp, an optional
-`[private]` marker, and the note body. Pure field-change history entries are
-omitted — only entries with an actual comment are shown.
+Pretty-print one issue with header, dates, and custom fields. When the issue
+has attachments (screenshots, logs), an `Attachments` block is printed after
+the custom-fields block, listing each attachment's ID, filename, size, type,
+author and creation date. Use that ID with `attachment download` to fetch the
+file itself. Pass `--comments` to also list the issue comments (journal notes):
+each entry shows author, timestamp, an optional `[private]` marker, and the
+note body. Pure field-change history entries are omitted — only entries with an
+actual comment are shown.
 
 ```bash
 sprintly issue show 39
 sprintly issue show 39 --comments
+sprintly issue show 39 --json
+sprintly issue show 39 --field description --raw
+```
+
+See [Machine-readable output](#3a-machine-readable-output) for `--json` / `--field` / `--raw`.
+
+### `attachment upload --id ISSUE_ID --file PATH [...]`
+
+Attach one or more local files to an issue. This is the only supported way to
+get a file **into** the tracker — the REST two-step (`POST /api/uploads`, then
+`PUT /api/issues/<id>` with an `uploads` array) is handled inside the command.
+
+All `--file` arguments land in **one** journal entry, so attaching three files
+plus a comment produces a single history record rather than four. The stored
+filename is computed once and reused for both REST steps, which matters: the
+backend checks the filename on download, and a mismatch turns into a `404`
+later rather than an error at upload time.
+
+```bash
+# One file, with a comment, in a single journal entry:
+sprintly attachment upload --id 257 --file ./leads.csv \
+  --notes "<p>Final list, 66 rows.</p>"
+
+# Several files at once — still one journal entry:
+sprintly attachment upload --id 257 --file ./leads.csv --file ./brief.md
+
+# Override the stored name (single --file only):
+sprintly attachment upload --id 257 --file ./tmp.html --filename "report Q3.html"
+```
+
+- `--file PATH` — repeatable. A missing path is reported before any network call.
+- `--content-type TYPE` — applies to every `--file`; by default it is guessed
+  from the extension.
+- `--notes TEXT` — comment posted together with the files. Primitive HTML, same
+  rule as `--description` (see Formatting below).
+- `--filename NAME` — store under a different name; an error when combined with
+  more than one `--file`, rather than silently reusing one name.
+- After the upload the command re-reads the issue and prints the new attachment
+  IDs — those are the IDs `attachment download` expects. `--json` returns
+  `{"issue", "count", "uploaded":[{"id","filename","filesize","contentType"}]}`.
+
+### `attachment download --id ATTACHMENT_ID [--output PATH]`
+
+Download the bytes of an issue attachment (e.g. a screenshot). The ID comes
+from the `Attachments` block of `issue show`. The command fetches the
+attachment metadata first, so it works from just the ID — no need to run
+`issue show` beforehand. With no `--output`, the file is written to the
+attachment's original filename in the current directory; `--output PATH`
+(or `-o PATH`) chooses the destination, and `-o -` streams the bytes to stdout
+for piping.
+
+```bash
+# Save under the original filename:
+sprintly attachment download --id 512
+
+# Explicit path:
+sprintly attachment download --id 512 --output ./bug-repro.png
+
+# Pipe to stdout:
+sprintly attachment download --id 512 -o - | wc -c
 ```
 
 ### `issue list`
@@ -101,6 +215,7 @@ Key flags:
 - `--assignee me` / `--author me` — `issue list` only. (`issue create`/`update` also accept `--assignee me`; see Section 4 Create/Update.)
 - `--cf ID=VALUE` filters by a custom field; repeat for additional fields.
 - `--columns` controls output. Available: `id,subject,project,type,status,priority,author,assignee,category,sprint,parent,start-date,due-date,done-ratio,estimated-hours,is-private,created,updated,description`; add a custom field with `cf:<id>`.
+- Table cells are collapsed to a single line (line breaks inside a value become spaces) so columns stay aligned, and the free-text columns (`description`, `cf:<id>`) are cut at 120 characters with a trailing `…`. Both are display-only concessions: for a value you intend to *use*, take `--json` or `issue show --field` instead of a column.
 - Date filters (`--created-on`, `--updated-on`, `--start-date`, `--due-date`) are pass-through. Examples: `>=2026-01-01`, `><2026-01-01|2026-06-30`, `t` (today), `lw` (last week).
 - Pagination: `--limit N` (≤100) + `--offset N`, or `--all` to fetch every page.
 - `--sort field[:desc][,field2[:desc]]` — e.g. `priority:desc,updated_on:desc`.
@@ -191,6 +306,7 @@ sprintly users --include memberships,groups --all
 
 Key flags:
 
+- `--project ID` — list the members of one project instead of every account. Works **without** administrator rights (it reads project memberships), and returns IDs and names only; `--status`, `--group` and `--include` do not apply. This is the way to resolve a person to a numeric id when plain `users` answers `403`.
 - `--name SUBSTR` — substring match over `login`, `mail`, `firstname`, `lastname`.
 - `--status active|locked|registered` — account state filter.
 - `--group ID` — restrict to a group membership.
@@ -280,7 +396,9 @@ This rule applies even when the user has not asked for status updates — they e
 ## 6. Known gaps & workarounds
 
 - No `issue delete`. To close, set `--status` to the `Done` ID (`sprintly statuses` to find it).
-- No standalone comment command. Use `issue update --id N --notes "…"`.
+- No standalone comment command. Use `issue update --id N --notes "…"`, or `attachment upload --notes "…"` when a file goes with it.
+- No attachment **delete**. Removing a stale attachment still needs `DELETE /api/attachments/<id>.json` with `Authorization: Bearer $(sprintly token)`.
+- The full custom-field dictionary and the global user list are admin-only; `custom-fields` and `users --project ID` degrade gracefully instead of failing (see Section 3).
 
 ## 7. When NOT to use this skill
 
