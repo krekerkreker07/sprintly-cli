@@ -166,8 +166,12 @@ jobs:
             os: windows-latest
             kind: native
             ext: .exe
+          # macos-14 GitHub зняв з обслуговування (листопад 2026): джоб падає за
+          # 1 с з «The configuration 'macos-14-arm64-us-default' is not
+          # supported». Мітку тримаємо явною, не macos-latest — щоб переїзд на
+          # нову macOS був свідомим бампом, а не тихою зміною SDK/Xcode.
           - target: macos-arm64
-            os: macos-14
+            os: macos-15
             kind: native
           # x86_64 macOS збираємо через Rosetta 2 на Apple Silicon runner-і:
           # нативні Intel runners (macos-13) більше недоступні для public
@@ -176,7 +180,7 @@ jobs:
           # (~15 хв), тому окремо кешуємо ~/.ghcup розділеним
           # restore+save-патерном (див. нижче).
           - target: macos-x86_64
-            os: macos-14
+            os: macos-15
             kind: macos-rosetta
 
     name: build (${{ matrix.target }})
@@ -268,7 +272,7 @@ jobs:
           ls -lh out/
           file "out/${ARTIFACT}" || true
 
-      # ---- macOS Intel via Rosetta 2 on macos-14 (Apple Silicon) host --------
+      # ---- macOS Intel via Rosetta 2 on macos-15 (Apple Silicon) host --------
       # Кеш-стратегія: ОКРЕМИЙ restore і save для ~/.ghcup, щоб збереження
       # відбувалося ОДРАЗУ після успішного bootstrap, а не як post-step
       # цілого job-у. Інакше будь-який фейл build-кроку → cache.save не
@@ -289,8 +293,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # macos-14 runners ship with Rosetta 2 pre-installed; ensure anyway.
-          softwareupdate --install-rosetta --agree-to-license 2>/dev/null || true
+          # macos-15 arm64 runners ship with Rosetta 2 pre-installed; ensure anyway
+          # (sudo: без нього softwareupdate мовчки не ставить Rosetta).
+          sudo softwareupdate --install-rosetta --agree-to-license 2>/dev/null || true
           # Якщо кеш ~/.ghcup відновлено — пропускаємо `curl | sh`, який щоразу
           # стягує і інсталяцію tarball-ів. Це найбільша економія для цього job-у.
           if [ -x "$HOME/.ghcup/bin/ghc" ] && [ -x "$HOME/.ghcup/bin/cabal" ]; then
