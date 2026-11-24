@@ -24,7 +24,7 @@
   ],
   "commands": {
     "issue show": {
-      "purpose": "Show full detail for one issue.",
+      "purpose": "Show full detail for one issue, including attachments and a Relations block when the issue has relations.",
       "required": ["ISSUE_ID"],
       "flags": {
         "--comments": "Also list the issue comments (journal notes): author, timestamp, optional [private] marker, note body. Field-change-only history entries are omitted."
@@ -87,6 +87,28 @@
         "--private-notes": "Mark the appended comment as private"
       },
       "example": "sprintly issue update --id 39 --status 6 --notes 'Ready for review'"
+    },
+    "issue relation list": {
+      "purpose": "List an issue's relations to other issues, seen from that issue's side, with the related issues' subjects.",
+      "required": ["ISSUE_ID"],
+      "json_keys": ["id", "issue", "type", "relatedIssue", "relatedSubject", "delay"],
+      "example": "sprintly issue relation list 41"
+    },
+    "issue relation add": {
+      "purpose": "Relate two issues; reads as ISSUE_ID <type> --to OTHER.",
+      "required": ["ISSUE_ID", "--to"],
+      "flags": {
+        "--to": "Related issue (62 or SPR-62)",
+        "--type": "relates (default) | blocks | blocked | precedes | follows | duplicates | duplicated | copied_to | copied_from; validated client-side",
+        "--delay": "Gap in days; only with precedes/follows"
+      },
+      "notes": "Needs the project's 'Manage issue relations' permission; a 403 is reported as that. Parent/child hierarchy is --parent on issue create/update, not a relation.",
+      "example": "sprintly issue relation add 39 --to 41 --type blocks"
+    },
+    "issue relation delete": {
+      "purpose": "Delete a relation by its ID (ID column of `issue relation list`).",
+      "required": ["RELATION_ID"],
+      "example": "sprintly issue relation delete 23"
     },
     "users": {
       "purpose": "List backend users with substring / status / group filters, pagination, and selectable columns. Used to look up a numeric user id when `me` does not apply (e.g. for --watcher).",
@@ -197,6 +219,11 @@
       "id": "no-comment-command",
       "summary": "No standalone comment subcommand.",
       "workaround": "Use `issue update --id N --notes \"…\"` to add a journal entry."
+    },
+    {
+      "id": "no-relation-edit",
+      "summary": "Relations cannot be edited in place.",
+      "workaround": "`issue relation delete ID`, then `issue relation add` with the new type/delay."
     }
   ],
   "files": {

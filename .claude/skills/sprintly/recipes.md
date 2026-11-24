@@ -156,3 +156,17 @@ some-generator | sprintly wiki edit --project spr \
 ```
 
 Body follows the same primitive-HTML rule as issue descriptions / notes — Markdown is not interpreted.
+
+## 12. Link issues (blocks / relates / precedes) and unlink them
+
+```bash
+# #41 cannot start until #39 is done
+sprintly issue relation add 39 --to 41 --type blocks
+
+# Check from either side — #41 shows "blocked by 39"
+sprintly issue relation list 41
+
+# Remove it again: take the ID column from the list
+rid=$(sprintly issue relation list 41 --json | jq '.[] | select(.relatedIssue == 39) | .id')
+sprintly issue relation delete "$rid"
+```

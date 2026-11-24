@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__sprintly__sprintly_projects",
+      "mcp__sprintly__sprintly_issue_list"
+    ]
+  }
+}

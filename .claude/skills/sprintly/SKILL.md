@@ -79,6 +79,25 @@ sprintly issue show 39
 sprintly issue show 39 --comments
 ```
 
+When the issue has relations to other issues, a `Relations:` block (relation ID, type, other issue, delay) follows the attachments.
+
+### `issue relation list | add | delete`
+
+Relations link two issues without a parent/child hierarchy (for epic → story → subtask use `--parent` on create/update). A relation reads as `ISSUE_ID <type> --to OTHER`.
+
+```bash
+sprintly issue relation list 39                         # every relation of #39, with subjects
+sprintly issue relation add 39 --to 41                  # default type: relates
+sprintly issue relation add 39 --to 41 --type blocks    # #39 blocks #41
+sprintly issue relation add 39 --to 41 --type precedes --delay 2
+sprintly issue relation delete 23                       # RELATION_ID from the list's ID column
+```
+
+- `--type`: `relates` (default), `blocks`, `blocked`, `precedes`, `follows`, `duplicates`, `duplicated`, `copied_to`, `copied_from` (`copied-to` also accepted). Validated client-side.
+- `--delay DAYS` only with `precedes` / `follows`.
+- `list` shows each relation from the asked issue's side: a `blocks` created on #39 appears on #41 as `blocked by 39`. `--json` keys: `id`, `issue`, `type`, `relatedIssue`, `relatedSubject`, `delay`.
+- Adding/deleting needs the project's *Manage issue relations* permission; a 403 is reported as exactly that.
+
 ### `issue list`
 
 Search issues. Repeat ID flags for OR semantics across the same field.
@@ -280,6 +299,7 @@ This rule applies even when the user has not asked for status updates — they e
 ## 6. Known gaps & workarounds
 
 - No `issue delete`. To close, set `--status` to the `Done` ID (`sprintly statuses` to find it).
+- No way to edit a relation in place. Delete it (`issue relation delete ID`) and add it again with the new type/delay.
 - No standalone comment command. Use `issue update --id N --notes "…"`.
 
 ## 7. When NOT to use this skill

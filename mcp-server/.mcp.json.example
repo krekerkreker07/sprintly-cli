@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "sprintly": {
+      "command": "node",
+      "args": ["./mcp-server/dist/server.js"],
+      "env": {
+        "SPRINTLY_BIN": ""
+      }
+    }
+  }
+}
