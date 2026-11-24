@@ -173,15 +173,16 @@ jobs:
           - target: macos-arm64
             os: macos-15
             kind: native
-          # x86_64 macOS збираємо через Rosetta 2 на Apple Silicon runner-і:
-          # нативні Intel runners (macos-13) більше недоступні для public
-          # репо безкоштовно, а cross-compile з arm64 → x86_64 у GHC поки
-          # потребує custom toolchain. Bootstrap ghcup під Rosetta дорогий
-          # (~15 хв), тому окремо кешуємо ~/.ghcup розділеним
-          # restore+save-патерном (див. нижче).
+          # x86_64 macOS — нативно на Intel-раннері macos-15-intel (останній
+          # x86_64-образ GitHub, підтримка до серпня 2027). Раніше збирали через
+          # Rosetta на arm64-хості, але цей джоб стоїть у тій самій черзі, що й
+          # macos-arm64, і при нестачі arm64-потужностей GitHub його не бере
+          # («job was not acquired by Runner», SPR-4665). Rosetta-кроки нижче
+          # лишаємо як запасний варіант на час після зняття Intel-образів:
+          # повернення = `os: macos-15` + `kind: macos-rosetta`.
           - target: macos-x86_64
-            os: macos-15
-            kind: macos-rosetta
+            os: macos-15-intel
+            kind: native
 
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
@@ -273,6 +274,7 @@ jobs:
           file "out/${ARTIFACT}" || true
 
       # ---- macOS Intel via Rosetta 2 on macos-15 (Apple Silicon) host --------
+      # Зараз НЕ використовується (x86_64 збирається нативно, див. matrix).
       # Кеш-стратегія: ОКРЕМИЙ restore і save для ~/.ghcup, щоб збереження
       # відбувалося ОДРАЗУ після успішного bootstrap, а не як post-step
       # цілого job-у. Інакше будь-який фейл build-кроку → cache.save не
@@ -396,7 +398,7 @@ jobs:
             dist-newstyle
           key: cabal-${{ matrix.target }}-ghc${{ env.GHC_VERSION }}-cabal${{ env.CABAL_VERSION }}-${{ hashFiles('sprintlycli.cabal') }}
 
-      # ---- Ad-hoc codesign for macOS (native arm64 + Rosetta x86_64) ---------
+      # ---- Ad-hoc codesign for macOS (native arm64/x86_64 + Rosetta fallback) -
       # Без підпису macOS відмовляється запускати скачаний бінарник з
       # "killed: 9" / "is damaged" (особливо на Apple Silicon). Ad-hoc підпис
       # (-s -) не вимагає AppleID акаунту, але дає бінарнику валідний embedded
